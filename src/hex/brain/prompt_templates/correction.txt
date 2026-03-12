@@ -1,0 +1,10 @@
+The previous SQL query failed with this error:
+{error}
+
+Original question: {question}
+Previous SQL: {previous_sql}
+
+Please fix the SQL query and respond with the corrected JSON object. Remember:
+- Use ONLY SQLite syntax
+- Use ONLY the tables and columns from the schema
+- The JSON format must be: {{"sql": "...", "explanation": "...", "suggested_chart": "...", "confidence": ...}}

@@ -1,0 +1,3 @@
+Question: {question}
+
+Respond with ONLY the JSON object.
