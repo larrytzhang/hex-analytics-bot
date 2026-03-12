@@ -1,0 +1,601 @@
+================================================================================
+          AGENTIC BRAIN MODULE — ARCHITECTURAL PLAN
+================================================================================
+
+Project: Hex — Slack Bot for Data Questions (Text + Charts)
+Module:  Agentic Brain (LLM-powered SQL generation & orchestration)
+Date:    2026-03-12
+
+================================================================================
+1. MODULE RESPONSIBILITIES
+================================================================================
+
+The Agentic Brain is the cognitive core of the bot. It:
+
+  - Accepts plain-English questions from upstream callers (Slack handler)
+  - Injects semantic layer context (database schema, table descriptions,
+    column metadata, example values) into an LLM prompt
+  - Calls Claude API to generate SQL from the question + context
+  - Coordinates with the Database module to execute the SQL
+  - Coordinates with the Charting module to visualize results
+  - Returns a structured response (text summary, chart artifact, raw data)
+  - Self-corrects when the LLM produces invalid SQL (retry loop)
+
+It knows NOTHING about Slack, HTTP, or presentation formatting.
+
+
+================================================================================
+2. FOLDER STRUCTURE
+================================================================================
+
+hex/
+├── brain/
+│   ├── __init__.py              # Public API re-exports
+│   ├── interfaces.py            # Abstract base classes / Protocols
+│   ├── orchestrator.py          # Main entry point — coordinates the pipeline
+│   ├── llm_client.py            # Claude API wrapper (prompt building + calling)
+│   ├── semantic_layer.py        # Schema context loader (mock or real)
+│   ├── sql_validator.py         # Lightweight SQL sanity checks pre-execution
+│   ├── retry.py                 # Self-correction retry loop logic
+│   ├── prompt_templates/
+│   │   ├── system.txt           # System prompt template
+│   │   ├── user.txt             # User message template
+│   │   └── correction.txt       # Re-prompt template for SQL fix-up
+│   └── types.py                 # Shared dataclasses / TypedDicts
+├── db/                          # Database module (EXTERNAL — not our scope)
+│   └── interfaces.py            # We define what we EXPECT from this module
+├── charting/                    # Charting module (EXTERNAL — not our scope)
+│   └── interfaces.py            # We define what we EXPECT from this module
+└── tests/
+    └── brain/
+        ├── test_orchestrator.py
+        ├── test_llm_client.py
+        ├── test_semantic_layer.py
+        ├── test_sql_validator.py
+        └── test_retry.py
+
+Key principle: interfaces.py defines contracts. Everything else is implementation.
+Callers import from brain/__init__.py and never touch internals.
+
+
+================================================================================
+3. INTERFACE DEFINITIONS
+================================================================================
+
+------------------------------------------------------------------------------
+3A. SHARED TYPES  (brain/types.py)
+------------------------------------------------------------------------------
+
+    from dataclasses import dataclass, field
+    from typing import Any
+    from enum import Enum
+
+    class ChartType(Enum):
+        TABLE = "table"
+        BAR = "bar"
+        LINE = "line"
+        PIE = "pie"
+        NONE = "none"
+
+    @dataclass(frozen=True)
+    class ColumnMeta:
+        """Metadata for a single database column."""
+        name: str
+        dtype: str                          # e.g. "INTEGER", "TEXT", "TIMESTAMP"
+        description: str                    # Human-readable purpose
+        sample_values: list[str] = field(default_factory=list)
+
+    @dataclass(frozen=True)
+    class TableMeta:
+        """Metadata for a single database table."""
+        name: str
+        description: str
+        columns: list[ColumnMeta]
+
+    @dataclass(frozen=True)
+    class SemanticContext:
+        """The full schema context injected into the LLM prompt."""
+        tables: list[TableMeta]
+        dialect: str = "postgresql"         # SQL dialect hint
+        business_glossary: dict[str, str] = field(default_factory=dict)
+            # e.g. {"MRR": "Monthly Recurring Revenue = sum of active subscription amounts"}
+
+    @dataclass(frozen=True)
+    class GeneratedSQL:
+        """Output from the LLM after SQL generation."""
+        sql: str
+        explanation: str                    # LLM's plain-English explanation
+        suggested_chart: ChartType
+        confidence: float                   # 0.0–1.0 self-assessed confidence
+
+    @dataclass(frozen=True)
+    class QueryResult:
+        """Tabular result from database execution."""
+        columns: list[str]
+        rows: list[list[Any]]
+        row_count: int
+
+    @dataclass(frozen=True)
+    class ChartArtifact:
+        """A rendered chart ready for delivery."""
+        image_bytes: bytes
+        alt_text: str
+        chart_type: ChartType
+
+    @dataclass
+    class BrainResponse:
+        """The final structured output from the Brain module."""
+        text_summary: str                   # Plain-English answer
+        sql_used: str                       # The SQL that was executed
+        query_result: QueryResult | None    # Raw tabular data
+        chart: ChartArtifact | None         # Optional visualization
+        error: str | None = None            # Non-None if the pipeline failed
+        retries_used: int = 0               # How many self-correction attempts
+
+------------------------------------------------------------------------------
+3B. BRAIN PUBLIC INTERFACE  (brain/interfaces.py)
+------------------------------------------------------------------------------
+
+    from abc import ABC, abstractmethod
+
+    class BrainInterface(ABC):
+        """Public contract for the Agentic Brain module."""
+
+        @abstractmethod
+        async def ask(
+            self,
+            question: str,
+            *,
+            conversation_history: list[dict[str, str]] | None = None,
+        ) -> BrainResponse:
+            """
+            Accept a plain-English data question and return a structured
+            answer with text, SQL, data, and an optional chart.
+
+            Args:
+                question: The user's natural-language question.
+                conversation_history: Optional prior Q&A turns for
+                    multi-turn context (list of {"role": ..., "content": ...}).
+
+            Returns:
+                BrainResponse with text summary, executed SQL, tabular data,
+                and optional chart artifact.
+
+            Raises:
+                BrainError: If all retries are exhausted or an unrecoverable
+                    error occurs.
+            """
+            ...
+
+------------------------------------------------------------------------------
+3C. INTERFACES WE EXPECT FROM THE DATABASE MODULE  (db/interfaces.py)
+------------------------------------------------------------------------------
+
+    class DatabaseExecutor(ABC):
+        """Contract the Brain expects from the Database module."""
+
+        @abstractmethod
+        async def execute_readonly(self, sql: str) -> QueryResult:
+            """
+            Execute a read-only SQL query and return tabular results.
+
+            The implementation MUST:
+              - Enforce read-only mode (reject INSERT/UPDATE/DELETE/DROP)
+              - Apply a query timeout (recommended: 30 seconds)
+              - Limit result rows (recommended: 10,000 rows max)
+
+            Args:
+                sql: A SELECT query string.
+
+            Returns:
+                QueryResult with columns, rows, and row_count.
+
+            Raises:
+                DatabaseError: On connection failure, timeout, or SQL error.
+                ReadOnlyViolation: If the SQL attempts a write operation.
+            """
+            ...
+
+        @abstractmethod
+        async def get_schema_context(self) -> SemanticContext:
+            """
+            Return the current semantic layer (schema metadata).
+
+            Used by the Brain to inject context into the LLM prompt.
+            In the mock version this returns hardcoded metadata.
+            In production this introspects the live database.
+            """
+            ...
+
+------------------------------------------------------------------------------
+3D. INTERFACES WE EXPECT FROM THE CHARTING MODULE  (charting/interfaces.py)
+------------------------------------------------------------------------------
+
+    class ChartRenderer(ABC):
+        """Contract the Brain expects from the Charting module."""
+
+        @abstractmethod
+        async def render(
+            self,
+            query_result: QueryResult,
+            chart_type: ChartType,
+            *,
+            title: str = "",
+        ) -> ChartArtifact:
+            """
+            Render a chart from tabular data.
+
+            Args:
+                query_result: The data to visualize.
+                chart_type: Which chart to produce.
+                title: Optional chart title.
+
+            Returns:
+                ChartArtifact with image bytes and alt text.
+
+            Raises:
+                ChartError: If rendering fails (bad data shape, etc.)
+            """
+            ...
+
+        @abstractmethod
+        def supports(self, chart_type: ChartType) -> bool:
+            """Return True if this renderer can produce the given chart type."""
+            ...
+
+
+================================================================================
+4. PROMPT ENGINEERING STRATEGY
+================================================================================
+
+The prompt is split into three templates stored in brain/prompt_templates/.
+
+------------------------------------------------------------------------------
+4A. SYSTEM PROMPT  (system.txt)
+------------------------------------------------------------------------------
+
+Structure (in order):
+
+  1. ROLE DECLARATION
+     "You are a SQL analyst. Your ONLY job is to translate natural-language
+      questions into a single, executable {dialect} SQL SELECT query."
+
+  2. HARD CONSTRAINTS (non-negotiable rules)
+     - Output ONLY a SELECT statement. Never generate INSERT, UPDATE, DELETE,
+       DROP, ALTER, TRUNCATE, or any DDL/DML.
+     - Use ONLY the tables and columns listed in the schema below.
+       Do NOT invent table or column names.
+     - If the question cannot be answered from the available schema,
+       respond with: {"sql": null, "explanation": "...", "confidence": 0.0}
+     - Always qualify column names with table aliases to avoid ambiguity.
+     - Use explicit JOINs (never implicit comma joins).
+     - Never use SELECT *; always list specific columns.
+
+  3. SCHEMA CONTEXT (injected dynamically)
+     For each table:
+       TABLE: {table_name} — {description}
+       COLUMNS:
+         - {col_name} ({dtype}): {description} [examples: {sample_values}]
+
+  4. BUSINESS GLOSSARY (injected dynamically)
+     Term definitions so the LLM correctly maps domain language.
+       - "MRR" means Monthly Recurring Revenue = SUM(amount) WHERE ...
+       - "active user" means users.last_login >= CURRENT_DATE - INTERVAL '30 days'
+
+  5. OUTPUT FORMAT (strict JSON)
+     Respond with ONLY this JSON object, no markdown fences, no commentary:
+     {
+       "sql": "<the SQL query or null>",
+       "explanation": "<1-2 sentence explanation of what the query does>",
+       "suggested_chart": "<table|bar|line|pie|none>",
+       "confidence": <0.0 to 1.0>
+     }
+
+  6. EXAMPLES (2-3 few-shot examples)
+     Question: "How many users signed up last month?"
+     Answer: {"sql": "SELECT COUNT(*) ...", "explanation": "...", ...}
+
+Anti-hallucination techniques:
+  - Explicit closed-world assumption: "Use ONLY these tables/columns."
+  - Confidence score forces self-assessment; low confidence triggers review.
+  - No freeform output; strict JSON schema constrains the response surface.
+  - Few-shot examples anchor the expected behavior.
+
+------------------------------------------------------------------------------
+4B. USER PROMPT  (user.txt)
+------------------------------------------------------------------------------
+
+    Question: {question}
+
+    {conversation_context if multi-turn, else empty}
+
+    Remember: respond with ONLY the JSON object. No other text.
+
+------------------------------------------------------------------------------
+4C. CORRECTION PROMPT  (correction.txt — used in retry loop)
+------------------------------------------------------------------------------
+
+    The SQL you generated produced this error when executed:
+
+    ERROR: {error_message}
+
+    Original question: {question}
+    Your previous SQL: {previous_sql}
+
+    Analyze the error, fix the SQL, and respond with the corrected JSON object.
+    Do NOT repeat the same mistake.
+
+
+================================================================================
+5. DATA FLOW & LOGIC
+================================================================================
+
+Step-by-step pipeline inside orchestrator.py:
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  CALLER (e.g. Slack handler)                                    │
+    │  brain.ask("How many users signed up last month?")              │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 1: LOAD SEMANTIC CONTEXT                                  │
+    │  semantic_context = await db.get_schema_context()               │
+    │  → Returns TableMeta list, dialect, business glossary           │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 2: BUILD PROMPT                                           │
+    │  system_prompt = render_template("system.txt", semantic_context)│
+    │  user_prompt   = render_template("user.txt", question, history) │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 3: CALL LLM                                               │
+    │  raw_response = await llm_client.generate(system_prompt,        │
+    │                                           user_prompt)          │
+    │  Parse JSON → GeneratedSQL dataclass                            │
+    │  If sql is null → return BrainResponse(text=explanation,        │
+    │                                        error=None, chart=None)  │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 4: VALIDATE SQL (lightweight pre-checks)                  │
+    │  sql_validator.check(generated.sql)                              │
+    │  → Rejects write statements, dangerous patterns, syntax issues  │
+    │  → If invalid: go to STEP 6 (retry) without hitting the DB      │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 5: EXECUTE SQL                                            │
+    │  query_result = await db.execute_readonly(generated.sql)        │
+    │  → If DatabaseError: go to STEP 6 (retry)                       │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 6: SELF-CORRECTION RETRY LOOP (if error in steps 4 or 5)  │
+    │  For attempt in 1..MAX_RETRIES (default 2):                     │
+    │    correction_prompt = render_template("correction.txt",        │
+    │                          error_msg, question, previous_sql)     │
+    │    new_response = await llm_client.generate(system, correction) │
+    │    Re-validate and re-execute                                   │
+    │    If success: break and continue to STEP 7                     │
+    │  If all retries exhausted: return BrainResponse(error=...)      │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 7: GENERATE CHART (optional)                              │
+    │  if generated.suggested_chart != NONE                           │
+    │     and chart_renderer.supports(generated.suggested_chart):     │
+    │    chart = await chart_renderer.render(query_result,            │
+    │                 generated.suggested_chart,                      │
+    │                 title=question)                                  │
+    │  → If ChartError: log warning, set chart=None (non-fatal)       │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 8: BUILD TEXT SUMMARY                                     │
+    │  Use the LLM's explanation + query_result to compose a          │
+    │  1-3 sentence plain-English answer.                              │
+    │  (Can optionally call LLM again for summarization, or use       │
+    │   the explanation from Step 3 directly.)                        │
+    └────────────────────────┬────────────────────────────────────────┘
+                             │
+                             ▼
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  STEP 9: RETURN                                                 │
+    │  return BrainResponse(                                          │
+    │      text_summary = "...",                                      │
+    │      sql_used = generated.sql,                                  │
+    │      query_result = query_result,                               │
+    │      chart = chart_artifact or None,                            │
+    │      retries_used = N,                                          │
+    │  )                                                              │
+    └─────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+6. ERROR HANDLING
+================================================================================
+
+------------------------------------------------------------------------------
+6A. ERROR TAXONOMY
+------------------------------------------------------------------------------
+
+    BrainError (base)
+    ├── LLMError                    # Claude API failures
+    │   ├── LLMRateLimitError       # 429 — back off and retry
+    │   ├── LLMTimeoutError         # Request timeout
+    │   └── LLMResponseParseError   # Response wasn't valid JSON
+    ├── SQLGenerationError          # LLM produced unparseable/unsafe SQL
+    │   ├── WriteOperationDetected  # SQL contains INSERT/UPDATE/DELETE/DROP
+    │   └── SchemaViolation         # References tables/columns not in context
+    ├── DatabaseError               # Passthrough from DB module
+    └── ChartError                  # Passthrough from Charting module (non-fatal)
+
+------------------------------------------------------------------------------
+6B. RETRY & SELF-CORRECTION STRATEGY
+------------------------------------------------------------------------------
+
+    Configuration:
+      MAX_SQL_RETRIES  = 2          # Retries for bad SQL (with LLM correction)
+      MAX_API_RETRIES  = 3          # Retries for transient API errors
+      API_BACKOFF_BASE = 1.0        # Exponential backoff base (seconds)
+
+    Decision matrix:
+
+    Error Type                 | Action
+    ---------------------------+---------------------------------------------
+    LLMRateLimitError          | Exponential backoff, retry up to MAX_API_RETRIES
+    LLMTimeoutError            | Retry once, then fail
+    LLMResponseParseError      | Retry with correction prompt (tell LLM to
+                               |   output valid JSON), up to MAX_SQL_RETRIES
+    WriteOperationDetected     | Do NOT retry. Fail immediately. Log as
+                               |   security event. Return error to caller.
+    SchemaViolation            | Retry with correction prompt listing valid
+                               |   tables/columns
+    DatabaseError (SQL syntax) | Retry with correction prompt including the
+                               |   exact DB error message
+    DatabaseError (timeout)    | Suggest the LLM simplify (add LIMIT, remove
+                               |   subqueries), retry once
+    DatabaseError (connection) | Do NOT retry SQL generation. Fail with
+                               |   "database unavailable" message.
+    ChartError                 | Do NOT retry. Return response without chart.
+                               |   Log warning. Chart failure is non-fatal.
+
+------------------------------------------------------------------------------
+6C. SELF-CORRECTION LOOP DETAIL
+------------------------------------------------------------------------------
+
+    async def _execute_with_retries(self, generated: GeneratedSQL,
+                                     question: str) -> tuple[QueryResult, int]:
+        last_error = None
+        for attempt in range(MAX_SQL_RETRIES + 1):
+            try:
+                # Pre-validate
+                self.sql_validator.check(generated.sql)
+                # Execute
+                result = await self.db.execute_readonly(generated.sql)
+                return result, attempt
+            except (SQLGenerationError, DatabaseError) as e:
+                last_error = e
+                if isinstance(e, WriteOperationDetected):
+                    raise  # Never retry write attempts
+                if attempt < MAX_SQL_RETRIES:
+                    generated = await self._request_correction(
+                        question, generated.sql, str(e)
+                    )
+        raise SQLGenerationError(
+            f"Failed after {MAX_SQL_RETRIES} retries. Last error: {last_error}"
+        )
+
+------------------------------------------------------------------------------
+6D. CIRCUIT BREAKER (optional, for production)
+------------------------------------------------------------------------------
+
+    If the LLM API fails N times in a rolling window (e.g., 5 failures in
+    60 seconds), trip a circuit breaker and immediately return a friendly
+    error for subsequent requests instead of piling up failing API calls.
+    Reset after a cooldown period.
+
+------------------------------------------------------------------------------
+6E. LOGGING & OBSERVABILITY
+------------------------------------------------------------------------------
+
+    Every pipeline run logs (structured JSON):
+      - request_id (UUID)
+      - question (sanitized)
+      - generated_sql
+      - attempt_number
+      - llm_latency_ms
+      - db_latency_ms
+      - success: bool
+      - error_type (if any)
+      - retries_used
+
+    This enables debugging, monitoring, and prompt tuning over time.
+
+
+================================================================================
+7. CONFIGURATION
+================================================================================
+
+    All tunables are injected via a BrainConfig dataclass:
+
+    @dataclass
+    class BrainConfig:
+        claude_model: str = "claude-sonnet-4-6"
+        claude_api_key: str = ""              # From environment
+        max_sql_retries: int = 2
+        max_api_retries: int = 3
+        api_timeout_seconds: float = 30.0
+        db_query_timeout_seconds: float = 30.0
+        max_result_rows: int = 10_000
+        enable_chart_generation: bool = True
+        log_level: str = "INFO"
+
+    The orchestrator receives config + dependencies via constructor injection:
+
+    class BrainOrchestrator(BrainInterface):
+        def __init__(
+            self,
+            config: BrainConfig,
+            db: DatabaseExecutor,
+            chart_renderer: ChartRenderer,
+            llm_client: LLMClient | None = None,  # defaults to Claude
+        ):
+            ...
+
+
+================================================================================
+8. TESTING STRATEGY
+================================================================================
+
+    Unit tests:
+      - LLM client: mock the Claude API, verify prompt construction and
+        JSON parsing logic.
+      - SQL validator: feed known-good and known-bad SQL strings.
+      - Retry loop: mock LLM + DB to simulate failure/recovery sequences.
+      - Semantic layer: verify template rendering with mock schemas.
+
+    Integration tests:
+      - Full orchestrator pipeline with mock LLM and mock DB.
+      - Verify that a question flows through all steps and produces a
+        well-formed BrainResponse.
+      - Verify retry loop fires on simulated DB errors.
+
+    All tests use dependency injection — no real API calls in CI.
+
+
+================================================================================
+9. DESIGN DECISIONS & RATIONALE
+================================================================================
+
+    Decision                         | Rationale
+    ---------------------------------+------------------------------------------
+    Strict JSON output format        | Prevents freeform LLM output; makes
+                                     | parsing deterministic.
+    Closed-world schema injection    | The LLM can only reference tables/columns
+                                     | we provide. Reduces hallucination.
+    Separate validation before       | Catches write operations and obvious
+    execution                        | errors without hitting the DB.
+    Confidence score in LLM output   | Enables downstream logic (e.g., "low
+                                     | confidence" warning to user).
+    Chart failure is non-fatal       | Data answer is more important than
+                                     | visualization. Degrade gracefully.
+    Dependency injection everywhere  | Enables testing, swapping implementations
+                                     | (mock DB vs. real DB), and loose coupling.
+    Async throughout                 | LLM and DB calls are I/O-bound. Async
+                                     | lets the bot handle concurrent requests.
+
+
+================================================================================
+END OF PLAN
+================================================================================

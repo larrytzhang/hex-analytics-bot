@@ -1,0 +1,562 @@
+================================================================================
+          DATABASE EXECUTION ENGINE — COMPREHENSIVE ARCHITECTURAL PLAN
+================================================================================
+Module: execution_engine
+Role:   Bootstrap a mock database with seed data, accept SQL strings, execute
+        them safely, and return structured results (dicts/JSON). This module
+        knows nothing about Slack, LLMs, or charts.
+Primary Consumer: The Agentic Brain (via the public interface)
+================================================================================
+
+
+1. FOLDER STRUCTURE
+================================================================================
+
+execution_engine/
+├── __init__.py                 # Public re-exports (the "door" to this module)
+├── interface.py                # Abstract base class / Protocol definitions
+├── engine.py                   # Concrete implementation of the interface
+├── schema.py                   # DDL statements and table definitions
+├── seed.py                     # Seed/dummy data insertion logic
+├── result.py                   # QueryResult dataclass & serialization helpers
+├── errors.py                   # Custom exception hierarchy
+├── sanitizer.py                # SQL validation and safety checks
+└── tests/
+    ├── __init__.py
+    ├── test_engine.py           # Core execution tests
+    ├── test_sanitizer.py        # SQL safety/validation tests
+    ├── test_seed.py             # Seed data integrity tests
+    └── test_result.py           # Result formatting tests
+
+Separation Principles:
+  - interface.py defines WHAT the module can do (contracts).
+  - engine.py defines HOW it does it (implementation).
+  - Consumers import only from __init__.py, never from internal modules.
+  - schema.py and seed.py are internal concerns; they run automatically
+    when the engine is instantiated.
+
+
+2. INTERFACE DEFINITIONS
+================================================================================
+
+---------- interface.py ----------
+
+from abc import ABC, abstractmethod
+from typing import Optional
+from execution_engine.result import QueryResult
+
+
+class DatabaseEngineInterface(ABC):
+    """
+    Contract for the Database Execution Engine.
+
+    The Agentic Brain interacts with this module exclusively through
+    this interface. All implementations must honor these signatures.
+    """
+
+    @abstractmethod
+    def execute_query(self, sql: str) -> QueryResult:
+        """
+        Execute a SQL query string and return structured results.
+
+        Args:
+            sql: A raw SQL query string (SELECT, INSERT, UPDATE, DELETE).
+
+        Returns:
+            QueryResult: A structured object containing column names,
+            row data, row count, and metadata.
+
+        Raises:
+            QuerySyntaxError:    The SQL is malformed.
+            ForbiddenQueryError: The SQL attempts a disallowed operation
+                                 (e.g., DROP TABLE, ATTACH DATABASE).
+            QueryExecutionError: A runtime error occurred during execution
+                                 (e.g., referencing a nonexistent column).
+        """
+        ...
+
+    @abstractmethod
+    def get_schema_description(self) -> dict[str, list[dict[str, str]]]:
+        """
+        Return the full database schema as a dictionary.
+
+        Returns:
+            A dict mapping table names to lists of column descriptors.
+            Each column descriptor is:
+            {
+                "name": str,
+                "type": str,        # e.g. "TEXT", "INTEGER", "REAL"
+                "nullable": bool,
+                "primary_key": bool
+            }
+
+        Example:
+            {
+                "users": [
+                    {"name": "id",    "type": "INTEGER", "nullable": False, "primary_key": True},
+                    {"name": "email", "type": "TEXT",    "nullable": False, "primary_key": False},
+                    ...
+                ],
+                ...
+            }
+
+        Purpose:
+            The Brain can pass this schema to the LLM so it knows which
+            tables and columns are available when generating SQL.
+        """
+        ...
+
+    @abstractmethod
+    def health_check(self) -> bool:
+        """
+        Return True if the database connection is alive and seeded.
+        """
+        ...
+
+
+---------- result.py ----------
+
+from dataclasses import dataclass, field, asdict
+from typing import Any
+import json
+
+
+@dataclass(frozen=True)
+class QueryResult:
+    """
+    Immutable, structured container for query results.
+
+    Attributes:
+        success:      Whether the query executed without error.
+        columns:      Ordered list of column names in the result set.
+                      Empty list for non-SELECT statements.
+        rows:         List of tuples, one per result row.
+                      Empty list for non-SELECT statements.
+        row_count:    Number of rows returned (SELECT) or affected
+                      (INSERT/UPDATE/DELETE).
+        query:        The original SQL string that was executed.
+        error:        None on success; error message string on failure.
+    """
+    success: bool
+    columns: list[str] = field(default_factory=list)
+    rows: list[tuple[Any, ...]] = field(default_factory=list)
+    row_count: int = 0
+    query: str = ""
+    error: str | None = None
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        """
+        Convert row tuples to a list of dictionaries keyed by column name.
+
+        Returns:
+            [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}, ...]
+
+        This is the primary format the Brain will consume.
+        """
+        return [dict(zip(self.columns, row)) for row in self.rows]
+
+    def to_json(self) -> str:
+        """
+        Serialize the entire result to a JSON string.
+        """
+        payload = {
+            "success": self.success,
+            "columns": self.columns,
+            "data": self.to_dicts(),
+            "row_count": self.row_count,
+            "query": self.query,
+            "error": self.error,
+        }
+        return json.dumps(payload, default=str)
+
+
+---------- errors.py ----------
+
+class ExecutionEngineError(Exception):
+    """Base exception for all execution engine errors."""
+
+    def __init__(self, message: str, original_sql: str = ""):
+        self.original_sql = original_sql
+        super().__init__(message)
+
+    def to_dict(self) -> dict[str, str]:
+        """Structured error for the Brain to inspect or forward to the LLM."""
+        return {
+            "error_type": self.__class__.__name__,
+            "message": str(self),
+            "original_sql": self.original_sql,
+        }
+
+
+class QuerySyntaxError(ExecutionEngineError):
+    """Raised when the SQL string is malformed."""
+    pass
+
+
+class ForbiddenQueryError(ExecutionEngineError):
+    """Raised when the SQL attempts a disallowed operation."""
+    pass
+
+
+class QueryExecutionError(ExecutionEngineError):
+    """Raised on runtime errors (bad column reference, type mismatch, etc.)."""
+    pass
+
+
+---------- __init__.py ----------
+
+from execution_engine.interface import DatabaseEngineInterface
+from execution_engine.engine import SQLiteEngine
+from execution_engine.result import QueryResult
+from execution_engine.errors import (
+    ExecutionEngineError,
+    QuerySyntaxError,
+    ForbiddenQueryError,
+    QueryExecutionError,
+)
+
+__all__ = [
+    "DatabaseEngineInterface",
+    "SQLiteEngine",
+    "QueryResult",
+    "ExecutionEngineError",
+    "QuerySyntaxError",
+    "ForbiddenQueryError",
+    "QueryExecutionError",
+]
+
+
+3. MOCK DATA STRATEGY
+================================================================================
+
+3.1  Domain: A Small SaaS Company
+----------------------------------
+The mock database represents a fictional B2B SaaS company called "Acme
+Analytics" with ~3 years of operating data. The schema is small enough to
+be understandable but rich enough to support interesting analytical queries.
+
+3.2  Schema (5 Tables)
+-----------------------
+
+TABLE: users
+  - id              INTEGER   PRIMARY KEY AUTOINCREMENT
+  - email           TEXT      NOT NULL UNIQUE
+  - full_name       TEXT      NOT NULL
+  - role            TEXT      NOT NULL  (one of: 'admin', 'member', 'viewer')
+  - company         TEXT      NOT NULL
+  - created_at      TEXT      NOT NULL  (ISO 8601 timestamp)
+  - is_active       INTEGER   NOT NULL DEFAULT 1  (0 or 1)
+
+TABLE: plans
+  - id              INTEGER   PRIMARY KEY AUTOINCREMENT
+  - name            TEXT      NOT NULL UNIQUE  (e.g., 'Free', 'Pro', 'Enterprise')
+  - monthly_price   REAL      NOT NULL
+  - max_seats       INTEGER   NOT NULL
+
+TABLE: subscriptions
+  - id              INTEGER   PRIMARY KEY AUTOINCREMENT
+  - user_id         INTEGER   NOT NULL  REFERENCES users(id)
+  - plan_id         INTEGER   NOT NULL  REFERENCES plans(id)
+  - status          TEXT      NOT NULL  (one of: 'active', 'canceled', 'past_due')
+  - started_at      TEXT      NOT NULL  (ISO 8601)
+  - canceled_at     TEXT               (ISO 8601 or NULL)
+
+TABLE: invoices
+  - id              INTEGER   PRIMARY KEY AUTOINCREMENT
+  - subscription_id INTEGER   NOT NULL  REFERENCES subscriptions(id)
+  - amount          REAL      NOT NULL
+  - currency        TEXT      NOT NULL DEFAULT 'USD'
+  - issued_at       TEXT      NOT NULL  (ISO 8601)
+  - paid            INTEGER   NOT NULL DEFAULT 0  (0 or 1)
+
+TABLE: events
+  - id              INTEGER   PRIMARY KEY AUTOINCREMENT
+  - user_id         INTEGER   NOT NULL  REFERENCES users(id)
+  - event_type      TEXT      NOT NULL  (e.g., 'login', 'report_run',
+                                         'export', 'invite_sent')
+  - metadata        TEXT               (JSON string, nullable)
+  - occurred_at     TEXT      NOT NULL  (ISO 8601)
+
+3.3  Seed Volume
+-----------------
+  - plans:          3 rows (Free / Pro / Enterprise)
+  - users:          50 rows (spread across ~10 companies)
+  - subscriptions:  60 rows (some users upgraded/canceled over time)
+  - invoices:       ~200 rows (monthly invoices over simulated history)
+  - events:         ~500 rows (realistic product usage events)
+
+3.4  Seeding Mechanism
+-----------------------
+  - seed.py contains a function `seed_database(conn: sqlite3.Connection)`.
+  - It is called once during SQLiteEngine.__init__().
+  - It uses deterministic randomness (seeded random/Faker) so the data is
+    identical on every boot — critical for reproducible answers.
+  - DDL is separated in schema.py via a `create_tables(conn)` function.
+  - Startup order: create_tables(conn) -> seed_database(conn).
+  - A flag table (_meta with key 'seeded') prevents double-seeding if the
+    database file is reused across restarts.
+
+
+4. DATA FLOW & LOGIC
+================================================================================
+
+Step-by-step flow when the Brain calls `engine.execute_query(sql)`:
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  CALLER (Brain)                                                  │
+  │       │                                                          │
+  │       ▼                                                          │
+  │  engine.execute_query("SELECT email, full_name FROM users ...")  │
+  └──────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  STEP 1 — Sanitize                              │
+  │                                                 │
+  │  sanitizer.validate(sql) is called.             │
+  │                                                 │
+  │  Checks performed:                              │
+  │    a) Strip leading/trailing whitespace.         │
+  │    b) Reject empty strings.                      │
+  │    c) Block forbidden keywords via a denylist:   │
+  │       DROP, ALTER, ATTACH, DETACH, PRAGMA,       │
+  │       CREATE (tables already exist), VACUUM,     │
+  │       REINDEX.                                   │
+  │    d) Block multiple statements (no semicolons   │
+  │       except a trailing one). This prevents      │
+  │       injection of chained commands.             │
+  │    e) Block comment-based obfuscation (reject    │
+  │       queries containing /* or --).              │
+  │                                                 │
+  │  On violation → raise ForbiddenQueryError        │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  STEP 2 — Classify Query Type                   │
+  │                                                 │
+  │  Determine if the statement is:                 │
+  │    - READ  (SELECT)                             │
+  │    - WRITE (INSERT, UPDATE, DELETE)             │
+  │                                                 │
+  │  This classification determines how to build    │
+  │  the QueryResult (columns+rows vs. row_count).  │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  STEP 3 — Execute                               │
+  │                                                 │
+  │  Use a sqlite3.Cursor to execute the SQL.       │
+  │                                                 │
+  │  Implementation details:                        │
+  │    a) The connection uses row_factory = None     │
+  │       (tuples) for performance.                 │
+  │    b) A timeout is set on the connection (5s)    │
+  │       to prevent runaway queries.               │
+  │    c) Execution is wrapped in a try/except to   │
+  │       catch sqlite3.OperationalError and         │
+  │       sqlite3.DatabaseError.                    │
+  │    d) For WRITE queries, the engine calls        │
+  │       conn.commit() after execution.            │
+  │                                                 │
+  │  On sqlite3.OperationalError                    │
+  │    → inspect message:                           │
+  │      - "syntax error" → raise QuerySyntaxError  │
+  │      - otherwise      → raise QueryExecutionError│
+  │                                                 │
+  │  On any other sqlite3 exception                 │
+  │    → raise QueryExecutionError                  │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  STEP 4 — Format Result                         │
+  │                                                 │
+  │  READ queries:                                  │
+  │    - Extract column names from cursor.description│
+  │    - Fetch all rows via cursor.fetchall()        │
+  │    - Build QueryResult(                         │
+  │        success=True,                            │
+  │        columns=[col[0] for col in description], │
+  │        rows=fetched_rows,                       │
+  │        row_count=len(fetched_rows),             │
+  │        query=sql,                               │
+  │      )                                          │
+  │                                                 │
+  │  WRITE queries:                                 │
+  │    - Build QueryResult(                         │
+  │        success=True,                            │
+  │        columns=[],                              │
+  │        rows=[],                                 │
+  │        row_count=cursor.rowcount,               │
+  │        query=sql,                               │
+  │      )                                          │
+  └─────────────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────┐
+  │  STEP 5 — Return                                │
+  │                                                 │
+  │  Return the QueryResult to the caller.          │
+  │                                                 │
+  │  The Brain can then call:                       │
+  │    result.to_dicts()  → for LLM consumption     │
+  │    result.to_json()   → for serialization        │
+  │    result.columns     → for chart axis labels    │
+  │    result.rows        → for raw data access      │
+  └─────────────────────────────────────────────────┘
+
+
+5. ERROR HANDLING STRATEGY
+================================================================================
+
+5.1  Design Principle
+----------------------
+Every error is caught inside the engine and either:
+  (a) re-raised as a typed, structured exception (so the Brain can
+      pattern-match on error type), OR
+  (b) returned inside a QueryResult with success=False and the error field
+      populated (alternative "result-based" error style — see 5.4).
+
+The Brain should NEVER see a raw sqlite3 exception. All exceptions are
+translated into the custom hierarchy defined in errors.py.
+
+5.2  Exception Hierarchy
+-------------------------
+
+  ExecutionEngineError          (base — catch-all for the Brain)
+    ├── QuerySyntaxError        (malformed SQL)
+    ├── ForbiddenQueryError     (blocked by sanitizer)
+    └── QueryExecutionError     (runtime failures: bad column, type error, etc.)
+
+Every exception carries:
+  - message:       Human-readable description of what went wrong.
+  - original_sql:  The SQL string that caused the error.
+  - to_dict():     Returns {"error_type", "message", "original_sql"} for the
+                   Brain to forward to the LLM for self-correction.
+
+5.3  Error Translation Map
+----------------------------
+
+  sqlite3.OperationalError ("near ... syntax error")
+      → QuerySyntaxError("SQL syntax error near '...': <detail>", sql)
+
+  sqlite3.OperationalError ("no such table: ...")
+      → QueryExecutionError("Table does not exist: <name>", sql)
+
+  sqlite3.OperationalError ("no such column: ...")
+      → QueryExecutionError("Column does not exist: <name>", sql)
+
+  sqlite3.IntegrityError
+      → QueryExecutionError("Integrity constraint violated: <detail>", sql)
+
+  Sanitizer rejection (forbidden keyword)
+      → ForbiddenQueryError("Operation not allowed: <keyword>", sql)
+
+  Sanitizer rejection (multiple statements)
+      → ForbiddenQueryError("Multiple statements not allowed", sql)
+
+  Timeout / resource exhaustion
+      → QueryExecutionError("Query timed out after 5 seconds", sql)
+
+5.4  Dual Error Reporting (Exception vs. Result)
+--------------------------------------------------
+The engine supports two usage patterns. The Brain can choose either:
+
+  Pattern A — Exception-based (default):
+    try:
+        result = engine.execute_query(sql)
+    except QuerySyntaxError as e:
+        # forward e.to_dict() to the LLM for SQL correction
+    except QueryExecutionError as e:
+        # handle runtime failure
+    except ForbiddenQueryError as e:
+        # inform user the operation is not permitted
+
+  Pattern B — Result-based (via a wrapper or flag):
+    The engine can expose a `safe_execute_query(sql) -> QueryResult` method
+    that catches all ExecutionEngineError exceptions internally and returns
+    a QueryResult with success=False and the error message populated.
+
+    result = engine.safe_execute_query(sql)
+    if not result.success:
+        # result.error contains the message
+        # result.query contains the original SQL
+
+  This lets the Brain avoid try/except boilerplate when it always wants
+  to forward errors to the LLM in a uniform format.
+
+5.5  LLM Self-Correction Support
+----------------------------------
+The error dict format is specifically designed so the Brain can include it
+in its next LLM prompt:
+
+    {"error_type": "QuerySyntaxError",
+     "message": "SQL syntax error near 'FORM': expected 'FROM'",
+     "original_sql": "SELECT * FORM users"}
+
+The LLM sees the error type, the human-readable message, and the original
+SQL, giving it maximum context to generate a corrected query.
+
+
+6. CONFIGURATION & INITIALIZATION
+================================================================================
+
+6.1  Engine Instantiation
+--------------------------
+The SQLiteEngine constructor accepts:
+  - db_path: str = ":memory:"
+      Use ":memory:" for ephemeral (default) or a file path for persistence.
+  - seed: bool = True
+      Whether to auto-seed on startup.
+  - random_seed: int = 42
+      Deterministic seed for reproducible dummy data.
+
+    engine = SQLiteEngine()                          # in-memory, auto-seeded
+    engine = SQLiteEngine(db_path="./dev.db")        # file-backed
+    engine = SQLiteEngine(seed=False)                # empty database
+
+6.2  Thread Safety
+-------------------
+SQLite in-memory databases are connection-scoped. The engine holds a single
+connection and is NOT thread-safe by default. If the host application needs
+concurrency:
+  - Option A: Use a file-backed database with check_same_thread=False and
+    a threading.Lock around execute_query.
+  - Option B: Create one engine instance per thread.
+
+The module documents this constraint but does not impose a concurrency model
+on the caller.
+
+
+7. TESTING STRATEGY
+================================================================================
+
+  test_engine.py:
+    - Verify SELECT returns correct columns, rows, and row_count.
+    - Verify INSERT/UPDATE/DELETE returns correct row_count.
+    - Verify get_schema_description() matches actual DDL.
+    - Verify health_check() returns True after init.
+
+  test_sanitizer.py:
+    - Verify forbidden keywords (DROP, ALTER, etc.) raise ForbiddenQueryError.
+    - Verify multi-statement strings raise ForbiddenQueryError.
+    - Verify comment injection (/* */, --) is blocked.
+    - Verify benign queries pass through unchanged.
+
+  test_seed.py:
+    - Verify expected row counts after seeding.
+    - Verify deterministic output (two engines with same seed produce
+      identical data).
+    - Verify double-seeding is prevented.
+
+  test_result.py:
+    - Verify to_dicts() output shape.
+    - Verify to_json() is valid JSON and round-trips correctly.
+    - Verify error results have success=False and error populated.
+
+
+================================================================================
+                              END OF PLAN
+================================================================================
