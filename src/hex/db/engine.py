@@ -37,7 +37,7 @@ class SQLiteEngine(DatabaseEngineInterface):
         Creates an in-memory SQLite database, applies the schema DDL,
         and populates it with deterministic seed data.
         """
-        self._conn = sqlite3.connect(":memory:")
+        self._conn = sqlite3.connect(":memory:", check_same_thread=False)
         self._conn.row_factory = None  # Use default tuple rows
         create_tables(self._conn)
         seed_database(self._conn)
