@@ -35,9 +35,6 @@ Thumbs.db
 .coverage
 htmlcov/
 
-# uv
-uv.lock
-
 # Node modules (legacy, no longer used)
 node_modules/
 
