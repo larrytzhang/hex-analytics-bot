@@ -1,0 +1,26 @@
+# Render Blueprint — one-click deploy. Wire this repo to Render via the
+# dashboard ("New + Blueprint" → pick this repo); Render reads this file
+# and creates the service with the right runtime, build, and env vars.
+#
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: hex-analytics-bot
+    runtime: docker
+    plan: free
+    region: oregon
+    # Health check gives Render a non-200 signal during cold starts so it
+    # waits for the FastAPI app to come up before routing traffic.
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # Required: get from console.anthropic.com → API Keys.
+      # `sync: false` means Render prompts for the value on first deploy
+      # rather than reading it from the blueprint (so the secret never
+      # lives in git).
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Optional: pin a model. Defaults to whatever BrainConfig picks.
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-4-6
+      # PORT is injected by Render automatically; web_main.py reads it.

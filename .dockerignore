@@ -1,0 +1,15 @@
+# Keep the build context small and avoid leaking dev files into the image.
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+.env
+.env.example
+node_modules
+tasks/
+plans/
+*.md
+master-plan.txt
+qa-breaker.js
+package*.json
