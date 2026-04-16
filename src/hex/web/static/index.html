@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hex Analytics Bot — Demo</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      /* Subtle font tweak so it doesn't read as raw Tailwind boilerplate. */
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif; }
+      .pill { transition: background 120ms ease, transform 120ms ease; }
+      .pill:hover { transform: translateY(-1px); }
+      .fade-in { animation: fade 200ms ease both; }
+      @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    </style>
+  </head>
+  <body class="bg-slate-50 text-slate-900 min-h-screen">
+    <div class="max-w-3xl mx-auto px-6 py-10">
+      <!-- Header -->
+      <header class="mb-8">
+        <div class="flex items-center gap-3 mb-2">
+          <div class="w-10 h-10 rounded-lg bg-slate-900 text-white grid place-content-center font-semibold">Hx</div>
+          <h1 class="text-2xl font-semibold tracking-tight">Hex Analytics Bot — Demo</h1>
+        </div>
+        <p class="text-slate-600 text-sm leading-relaxed">
+          Ask a plain-English question. The bot writes SQL, runs it on a mock SaaS dataset, and returns an answer plus a chart.
+          <span class="block mt-1 text-slate-500">
+            Mock schema: <code class="bg-slate-200 px-1 rounded">plans</code>,
+            <code class="bg-slate-200 px-1 rounded">users</code>,
+            <code class="bg-slate-200 px-1 rounded">subscriptions</code>,
+            <code class="bg-slate-200 px-1 rounded">invoices</code>,
+            <code class="bg-slate-200 px-1 rounded">events</code>.
+          </span>
+        </p>
+      </header>
+
+      <!-- Input -->
+      <section class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
+        <label for="question" class="block text-sm font-medium text-slate-700 mb-2">Your question</label>
+        <div class="flex gap-2">
+          <input
+            id="question"
+            type="text"
+            placeholder="e.g. Show monthly revenue by plan"
+            maxlength="500"
+            class="flex-1 px-3 py-2 rounded-lg border border-slate-300 focus:border-slate-500 focus:ring-2 focus:ring-slate-200 outline-none"
+          />
+          <button
+            id="ask"
+            class="px-5 py-2 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
+          >Ask</button>
+        </div>
+
+        <!-- Sample question pills -->
+        <div class="mt-4">
+          <p class="text-xs uppercase tracking-wide text-slate-500 mb-2">Try one of these</p>
+          <div id="samples" class="flex flex-wrap gap-2"></div>
+        </div>
+      </section>
+
+      <!-- Result panel -->
+      <section id="result" class="hidden bg-white rounded-xl shadow-sm border border-slate-200 p-5 fade-in">
+        <div id="loading" class="hidden flex items-center gap-3 text-slate-600">
+          <div class="w-4 h-4 border-2 border-slate-300 border-t-slate-900 rounded-full animate-spin"></div>
+          <span>Thinking…</span>
+        </div>
+
+        <div id="answer" class="hidden">
+          <div id="error-box" class="hidden mb-4 p-3 rounded-lg bg-red-50 border border-red-200 text-red-800 text-sm"></div>
+          <p id="text" class="text-slate-800 whitespace-pre-wrap leading-relaxed"></p>
+
+          <div id="chart-wrap" class="hidden mt-5">
+            <img id="chart" alt="" class="w-full rounded-lg border border-slate-200" />
+          </div>
+
+          <div id="table-wrap" class="hidden mt-5 overflow-x-auto">
+            <table id="table" class="min-w-full text-sm border border-slate-200 rounded-lg overflow-hidden">
+              <thead class="bg-slate-100 text-slate-700"><tr id="thead-row"></tr></thead>
+              <tbody id="tbody" class="divide-y divide-slate-200"></tbody>
+            </table>
+            <p id="row-note" class="text-xs text-slate-500 mt-1"></p>
+          </div>
+
+          <p id="latency" class="text-xs text-slate-400 mt-4"></p>
+        </div>
+      </section>
+
+      <footer class="mt-10 text-xs text-slate-400 text-center">
+        Built as a portfolio demo · Single-turn, in-memory SQLite, no auth ·
+        <a class="underline" href="https://github.com/" target="_blank" rel="noreferrer">repo</a>
+      </footer>
+    </div>
+
+    <script>
+      // Sample questions chosen to exercise different chart types and to
+      // map cleanly onto the mock SaaS schema.
+      const SAMPLES = [
+        "Show monthly revenue by plan",
+        "How many users signed up last month?",
+        "Top 10 customers by total spend",
+        "Daily active users over time",
+      ];
+
+      const $ = (id) => document.getElementById(id);
+
+      // Render sample pills.
+      const samples = $("samples");
+      SAMPLES.forEach((q) => {
+        const b = document.createElement("button");
+        b.textContent = q;
+        b.className = "pill text-sm px-3 py-1.5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-700";
+        b.onclick = () => { $("question").value = q; ask(); };
+        samples.appendChild(b);
+      });
+
+      $("ask").onclick = ask;
+      $("question").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+
+      async function ask() {
+        const q = $("question").value.trim();
+        if (!q) return;
+
+        $("result").classList.remove("hidden");
+        $("loading").classList.remove("hidden");
+        $("answer").classList.add("hidden");
+        $("ask").disabled = true;
+
+        try {
+          const res = await fetch("/api/ask", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question: q }),
+          });
+          const data = await res.json();
+          render(data);
+        } catch (err) {
+          render({ text: "", error: "Network error: " + err.message });
+        } finally {
+          $("loading").classList.add("hidden");
+          $("answer").classList.remove("hidden");
+          $("ask").disabled = false;
+        }
+      }
+
+      function render(data) {
+        // Error banner if present.
+        const errBox = $("error-box");
+        if (data.error) {
+          errBox.textContent = data.error;
+          errBox.classList.remove("hidden");
+        } else {
+          errBox.classList.add("hidden");
+        }
+
+        // Text answer (strip any trailing markdown table the orchestrator
+        // appended; we render the table separately for a cleaner UI).
+        let text = data.text || "";
+        const tableStart = text.indexOf("\n|");
+        if (tableStart !== -1) text = text.slice(0, tableStart).trim();
+        $("text").textContent = text;
+
+        // Chart.
+        if (data.chart_b64) {
+          $("chart").src = `data:${data.chart_mime || "image/png"};base64,${data.chart_b64}`;
+          $("chart").alt = text.slice(0, 120);
+          $("chart-wrap").classList.remove("hidden");
+        } else {
+          $("chart-wrap").classList.add("hidden");
+        }
+
+        // Table.
+        if (data.columns && data.columns.length && data.rows && data.rows.length) {
+          const headRow = $("thead-row");
+          headRow.innerHTML = "";
+          data.columns.forEach((c) => {
+            const th = document.createElement("th");
+            th.textContent = c;
+            th.className = "px-3 py-2 text-left font-semibold";
+            headRow.appendChild(th);
+          });
+          const tbody = $("tbody");
+          tbody.innerHTML = "";
+          data.rows.slice(0, 10).forEach((row) => {
+            const tr = document.createElement("tr");
+            row.forEach((v) => {
+              const td = document.createElement("td");
+              td.textContent = v;
+              td.className = "px-3 py-2 text-slate-700";
+              tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+          });
+          const note = data.row_count > 10
+            ? `Showing 10 of ${data.row_count} rows.`
+            : `${data.row_count} row${data.row_count === 1 ? "" : "s"}.`;
+          $("row-note").textContent = note;
+          $("table-wrap").classList.remove("hidden");
+        } else {
+          $("table-wrap").classList.add("hidden");
+        }
+
+        $("latency").textContent = data.latency_ms
+          ? `Pipeline: ${data.latency_ms} ms`
+          : "";
+      }
+    </script>
+  </body>
+</html>
