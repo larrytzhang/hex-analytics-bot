@@ -14,8 +14,10 @@ build/
 venv/
 env/
 
-# Environment variables
+# Environment variables — never commit secrets
 .env
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -36,5 +38,14 @@ htmlcov/
 # uv
 uv.lock
 
-# Node (for qa-breaker.js)
+# Node modules (legacy, no longer used)
 node_modules/
+
+# Local notes / outreach drafts — never push
+LARRY-STEPS.txt
+REACOUT.txt
+REACHOUT.txt
+nextsteps.txt
+*.local.txt
+plans/
+"plans folder/"
