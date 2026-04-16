@@ -1,47 +1,61 @@
-# Hex Agentic Analytics Slack Bot - Master Build Instructions
+# Engineering Guidelines
 
-You are the Principal Python Architect executing the comprehensive step-by-step build outlined in `master-plan.txt`. This system is an Agentic Analytics Slack Bot inspired by Hex.tech, designed to query databases, generate charts, and answer data questions autonomously.
 
-## The Strict Execution Loop
-For every single phase of the build, you MUST follow this exact loop:
+## 1. Core Principles
+- **Simplicity first**: Make every change as simple as possible. Touch minimal code. Senior-developer standards — no laziness, no temporary fixes, find root causes.
+- **Engineered enough**: Not under-engineered (fragile, hacky) and not over-engineered (premature abstraction, unnecessary complexity).
+- **Explicit over clever**: Bias toward clarity. Handle more edge cases, not fewer — thoughtfulness beats speed.
+- **DRY aggressively**: Flag repetition. Duplication is a design smell, not a shortcut.
+- **Comment everything**: Every function, class, and non-trivial block gets a comment explaining *why*. Code shows *what*; comments explain intent, constraints, and tradeoffs.
+- **Separate interface from implementation**: Public contracts live apart from private mechanics. Callers depend on interfaces, never on internal details. Changing implementation must not force callers to change.
 
-1. **Build:** Write the code for the current phase based on the Master Plan. Ensure interfaces are separated from implementations.
-2. **Test:** Run `uv run pytest` (or `pytest` depending on the environment). You must fix any failing tests before moving to step 3. (Note: MVP strategy is test-after, so write basic interface validation tests as you finish a module).
-3. **QA Review:** Run `node qa-breaker.js`. (This script will automatically stage your changes and have o3-mini review them for architectural compliance).
-    - If the script outputs `APPROVED` (exit code 0), you have permission to run `git commit -m "Phase [X] complete"` and move to the next phase.
-    - If the script outputs `REJECTED` (exit code 1), you MUST read the stdout feedback from the QA model, implement the exact fixes it requests, and repeat the loop starting from Step 2. Do NOT proceed to the next phase until QA approves.
-4. **Checkpoint & Iterate:** At the end of major phases, trigger the `systematic-debugging` and `gemini-sync` routines as outlined in the Master Plan before moving to the next task in the `task-orchestrator` checklist.
 
-## Global Rules
-- Do not stop or ask for permission to move to the next phase. Execute the entire pipeline autonomously based on the `master-plan.txt`.
-- If you get stuck in a QA loop for more than 3 attempts, add a comment in the code explaining the trade-off, bypass the test, commit, and move on to keep momentum.
+## 2. Planning & Task Management
+- Enter plan mode for any non-trivial task (3+ steps or architectural decisions). Skip it for simple, obvious fixes.
+- Write the plan to `tasks/todo.md` as a checkable list and confirm it with the user before touching code.
+- Write detailed specs upfront — reduce ambiguity before starting.
+- If anything goes sideways mid-task, STOP and re-plan. Don't keep pushing.
+- As you work: mark items complete, give a high-level summary at each step, and add a review section to `tasks/todo.md` when done.
 
-## Strict Architectural Rules
-You must strictly adhere to these rules at all times. Do not deviate.
 
-1. **Comment Everything:** Add a descriptive docstring/comment block before EVERY single function, class, or method explaining its specific functionality, inputs, and expected outputs.
-2. **Interface/Implementation Split:** Every module must strictly separate its interface from its implementation. Place public contracts in an `interfaces.py` or `__init__.py` file, and keep all execution logic internal.
-3. **Strict Module Boundaries (CRITICAL):** An outside folder can ONLY call the interface of another folder. *Example: `gateway` MUST NEVER import from `brain/internal_logic.py`. In fact, cross-module calls should exclusively be handled by the top-level `app/orchestrator.py`.*
-4. **Shared Types:** Never redefine core domain models (like `QueryResult`, `ChartType`, `SlackRequest`) locally. They MUST be imported from `src/hex/shared/models.py`.
+## 3. Review Protocol
+Before implementing non-trivial changes, review through the four lenses below. For every issue found: describe the problem concretely with file/line references, present 2–3 options (including "do nothing" when reasonable), state effort/risk/impact/maintenance for each, give an opinionated recommendation tied to the Core Principles, and wait for user agreement before proceeding. Pause after each section for feedback. Don't assume priorities on timeline or scale.
 
-## System Architecture & Folder Domains
-Respect the boundaries of the 6 core namespaces:
-- `src/hex/app`: The Orchestrator. The central nervous system that wires modules together and manages the async event loop.
-- `src/hex/gateway`: The Slack I/O layer. Listens to events, formats Slack blocks, and uploads image bytes. Knows nothing about data or AI.
-- `src/hex/brain`: The Agentic LLM layer. Manages Claude prompts, semantic context, and SQL generation.
-- `src/hex/db`: The Execution layer. Bootstraps SQLite, runs SQL safely (read-only), and returns raw data. Purely synchronous.
-- `src/hex/viz`: The Charting layer. Uses Matplotlib to turn data into image bytes. Purely synchronous.
-- `src/hex/shared`: Canonical data classes and enums used across the system.
 
-## AI & Python Bot Engineering Best Practices
-1. **The Async/Sync Divide:** Because we are dealing with long-running LLM calls and Slack API limits, `app`, `gateway`, and `brain` MUST be asynchronous (`asyncio`). However, `db` (SQLite) and `viz` (Matplotlib) are synchronous. You MUST wrap calls to `db` and `viz` in `asyncio.to_thread()` inside the orchestrator so you don't block the event loop.
-2. **Think Before Coding:** Use `<thinking>` tags to plan your architectural moves before writing to files. Ensure new code aligns perfectly with the established interfaces.
-3. **Fail Gracefully:** If the LLM generates bad SQL, or the question cannot be answered by the schema, the bot must catch the error and return a polite, text-only fallback to Slack. Do not let the app crash.
-4. **Type Safety First:** Rely heavily on Python type hints and strictly typed `dataclasses` (or Pydantic) in the `shared` module.
+1. **Architecture**: system design, component boundaries, coupling, data flow, scaling, single points of failure, security boundaries (auth, data access, API surface).
+2. **Code quality**: organization, DRY violations, error handling, missing edge cases, technical debt, over/under-engineering.
+3. **Tests**: coverage gaps across unit/integration/e2e, assertion strength, edge cases, untested failure modes and error paths.
+4. **Performance**: N+1 queries and DB access patterns, memory usage, caching opportunities, hot/high-complexity paths.
 
-## Context & Memory Management
-To prevent context bloat and token limits as we work through `master-plan.txt`, you must manage your memory.
 
-1. **End-of-Phase Summary:** After you successfully complete a phase and BEFORE starting the next one, write a brief summary of what was just built to your internal memory.
-2. **Context Reset:** Clear context every 2 phases. Ex. 2, 4, 6, etc.
-3. **Re-Read the Core:** After any context clear, your very next action MUST be to re-read `master-plan.txt` and this `claude.md` file to re-ground yourself and understand where this next section fits into the big picture before writing new code.
+For big changes, surface up to 4 issues per section. For small changes, surface one question per section.
+
+
+## 4. Testing
+- Well-tested code is non-negotiable — too many tests beats too few.
+- Cover unit, integration, and e2e paths where each applies.
+- Test failure modes and error paths, not just happy paths.
+- Never mark work complete without tests that prove correctness.
+
+
+## 5. Subagents
+- Use subagents liberally to keep the main context window clean.
+- Offload research, exploration, and parallel analysis.
+- One focused task per subagent.
+- For complex problems, throw more compute at it via parallel subagents.
+
+
+## 6. Verification & Elegance
+- Never mark a task complete without proving it works: run tests, check logs, demonstrate correctness. Diff behavior against main when relevant.
+- Ask: "Would a staff engineer approve this?"
+- For non-trivial changes, pause and ask "is there a more elegant way?" If a fix feels hacky, redo it knowing everything you now know.
+- Autonomous bug fixing: given a bug report, failing test, or broken CI — just fix it. Point at the logs/errors, resolve them, no hand-holding required.
+
+
+## 7. Self-Improvement
+- After any correction from the user, append the pattern and a preventive rule to `tasks/lessons.md`.
+- Review `tasks/lessons.md` at session start for the current project.
+- Iterate ruthlessly on these lessons until the mistake rate drops.
+
+
+
