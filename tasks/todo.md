@@ -166,6 +166,25 @@ Rewrite `README.md` with this structure:
 
 ---
 
-## Review section (filled in post-execution)
+## Review section (post-execution)
 
-_Empty until work completes._
+**Status:** all 6 phases complete. 5 atomic commits on main. 137/137 tests passing (was 120 → +17 new: 6 for compute_answer, 11 for web). Tree clean.
+
+**What changed vs the original plan:**
+- Switched deploy target from Vercel → Render (Vercel's 10s serverless timeout would fail Anthropic + matplotlib cold starts; Render gives the same free `*.onrender.com` UX without the timeout problem).
+- Skipped the seaborn restyling pass — `viz/styling.py` already had a usable `professional_light` theme; respecting "simplicity first / touch minimal code."
+- Added 1 extra test (handle_question without slack_client raises) for safety.
+- Added a whitespace-only-question guard in `web/server.py` that pydantic alone wouldn't catch.
+
+**Architectural decisions worth flagging:**
+- `AnswerResult` lives in `shared/models.py` (canonical types) so both `gateway/` and `web/` import it from the right place per the strict-boundary rule.
+- `AppOrchestrator(slack_client=None)` is allowed; `handle_question` raises if called without one. Loud failure beats silent half-baked response.
+- Web layer uses base64 PNG inline (not a separate `/chart/<id>` endpoint) because the demo is stateless and self-contained payloads are simpler than a chart-cache.
+- `asyncio.wait_for` in `/api/ask` so a hung LLM call can't pin a worker forever — important for an unauthenticated demo.
+
+**Known follow-ups (in README "What's Next"):**
+- Multi-turn / thread memory.
+- Real warehouse adapter (architecture supports it).
+- Auth on web UI (currently anyone with link burns API budget).
+- OpenTelemetry traces.
+- Question-hash cache.
