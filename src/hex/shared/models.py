@@ -242,6 +242,34 @@ class ChartResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+# ── LOADED TABLE (metadata returned after user CSV upload) ──
+
+
+@dataclass(frozen=True)
+class LoadedTable:
+    """Summary of a CSV the user uploaded and that was materialized into SQLite.
+
+    Produced by the DB module's CSV loader, consumed by the web layer
+    to build the upload response and the schema preview the UI renders.
+
+    Attributes:
+        table_name:    Sanitized SQL table name the CSV was loaded into.
+        columns:       Column info as ``{name, type}`` dicts, matching
+                       the shape of ``DatabaseEngineInterface.get_schema_description``
+                       so the Brain can consume the same schema format
+                       it already understands.
+        row_count:     Number of data rows inserted (excludes header).
+        preview_rows:  Up to 5 sample rows as dicts keyed by column name.
+                       Used purely to render a "here's what got loaded"
+                       preview in the UI — the Brain never sees these.
+    """
+
+    table_name: str
+    columns: list[dict[str, str]]
+    row_count: int
+    preview_rows: list[dict[str, Any]] = field(default_factory=list)
+
+
 # ── ANSWER RESULT (transport-agnostic — shared by Gateway and Web) ──
 
 

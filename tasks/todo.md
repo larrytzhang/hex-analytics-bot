@@ -1,190 +1,221 @@
-# Hex Bot — Demo-Ready Plan
+# Hex Bot — CSV Upload + Per-Session Isolation
 
-**Goal:** Make this codebase trivially demo-able to Hex leadership via (a) one clickable browser link and (b) a 90-second recorded video of the Slack flow.
+**Goal:** Let reviewers upload their own CSV and ask questions against it. Each browser session gets its own isolated in-memory database so two people clicking through the demo at the same time don't see each other's data.
 
-**Scope:** Demo-critical only. Multi-turn, Postgres swap, OTel, etc. are deferred to a "What's Next" section in the README.
+**Scope:** Option B from the design discussion — per-session isolation. Real data path only for the web UI; Slack stays on the mock dataset.
 
-**Estimated effort:** ~6 hours of Claude work + ~1 hour of Larry's manual work.
-
----
-
-## Phase 1 — Repo cleanup (15 min)
-
-- [ ] Delete `nextsteps.txt` (working notes, not for portfolio).
-- [ ] Delete duplicate `plans folder/` directory (the `plans/` deletion in git status is the canonical one — old planning docs do not belong in a portfolio repo).
-- [ ] Stage or revert the README.md change in git status so `git status` is clean before Phase 5 rewrite.
-- [ ] Add a `tasks/lessons.md` stub (empty header) to satisfy CLAUDE.md §7.
-- [ ] Commit: `chore: repo cleanup before demo prep`.
+**Estimated effort:** ~5–6 hours of careful work, ~8 atomic commits.
 
 ---
 
-## Phase 2 — Refactor orchestrator: separate compute from delivery (1.5 hr)
+## Architectural decisions (locked before start)
 
-**Why:** The web UI needs the same brain → viz pipeline as Slack. Today, `AppOrchestrator.handle_question` is hardcoded to return `SlackResponse` and uploads the chart inline. Extract a transport-agnostic compute step so both Slack and Web can call it.
-
-- [ ] Add `AnswerResult` dataclass to `src/hex/shared/models.py`:
-  - `text_summary: str`
-  - `query_result: QueryResult | None`
-  - `chart_bytes: bytes | None`
-  - `chart_mime: str` (default `"image/png"`)
-  - `error: str | None`
-- [ ] Add `_compute_answer(question: str) -> AnswerResult` to `AppOrchestrator`. Pure compute — no Slack calls.
-- [ ] Refactor `handle_question(SlackRequest) -> SlackResponse` to call `_compute_answer`, then handle Slack-specific delivery (file upload, thread reply).
-- [ ] Update `OrchestratorInterface` in `shared/interfaces.py` to expose both methods.
-- [ ] Add 4 unit tests in `src/hex/app/tests/test_compute_answer.py`:
-  - Success path (text + chart bytes returned).
-  - Brain raises `BrainError` → `AnswerResult.error` set, no crash.
-  - Viz raises `VisualizationError` → text returned, `chart_bytes=None`.
-  - Brain returns `suggested_chart=NONE` → text returned, no chart attempted.
-- [ ] All existing 120 tests still pass.
-- [ ] Commit: `refactor: extract _compute_answer from AppOrchestrator for transport-agnostic reuse`.
-
-**Architectural justification:** Keeps `app/orchestrator.py` as the only adapter between modules per CLAUDE.md §1. Web/ becomes a sibling I/O surface to gateway/, not a new orchestrator.
+1. **Brain-per-session, not DB param threading.** The upload creates a new `SQLiteEngine` + a new `BrainOrchestrator` pointing at it. `AppOrchestrator.compute_answer` gains a single optional `brain_override` parameter — Slack passes nothing (uses the mock brain injected at startup), Web passes the session's brain. One viz engine is shared (stateless).
+2. **SessionManager lives in `web/`.** Session storage is web-specific state. Keying: server-minted UUID returned in the upload response, stored by the frontend in `localStorage` and echoed in each `/api/ask`.
+3. **In-memory only.** Render free-tier disk is ephemeral anyway; no persistence needed for a demo. 30-min inactivity TTL, max 20 concurrent sessions, LRU eviction when full.
+4. **Upload limits:** 5 MB file, 10,000 rows, 50 columns. Enforced in the CSV loader; the HTTP layer caps the body size too.
+5. **Semantic glossary off for uploaded data.** The SaaS glossary (MRR, ARR, churn) is wrong for arbitrary CSVs. `BrainOrchestrator(use_glossary=False)` for session brains.
+6. **API surface additions (not replacements):**
+   - `POST /api/upload` (multipart) → `{session_id, table_name, schema, row_count}`
+   - `POST /api/ask` body gains optional `session_id` — absent = mock dataset, present = that session's data
+   - `DELETE /api/session/{session_id}` — explicit cleanup (frontend "Start over" button)
 
 ---
 
-## Phase 3 — Build the web module `src/hex/web/` (2.5 hr)
+## Phase 1 — DB: loadable SQLiteEngine + CSV parser (1 hr)
 
-**Goal:** One clickable link. User types a question, gets text + table + chart in <10 sec.
+The current `SQLiteEngine.__init__` unconditionally seeds mock data. Split that so we can construct a blank engine, then load a CSV into it.
 
-### Files to create
+### Files
 
-- `src/hex/web/__init__.py` — public exports.
-- `src/hex/web/config.py` — Pydantic `WebConfig` (HOST, PORT, defaults to 0.0.0.0:8000).
-- `src/hex/web/server.py` — FastAPI app factory `create_app(orchestrator: AppOrchestrator) -> FastAPI`:
-  - `GET /` → serve `static/index.html`.
-  - `GET /healthz` → `{"status": "ok"}` (for Render health checks).
-  - `POST /api/ask` → body `{question: str}` → returns JSON `{text, table_md, chart_b64, error}`.
-  - Calls `orchestrator._compute_answer(question)` (wrap in `asyncio.create_task` for timeout safety).
-  - 30-second request timeout. On timeout, return `{error: "Question took too long, try a simpler one."}`.
-  - 422 if question empty or >500 chars.
-- `src/hex/web/static/index.html` — single page, no build step:
-  - Tailwind via CDN for clean styling.
-  - Header with "Hex Analytics Bot — Demo" title and a banner: "Uses mock SaaS data (5 tables: plans, users, subscriptions, invoices, events)."
-  - Input box + "Ask" button.
-  - 4 sample-question pill buttons that pre-fill the input ("Show revenue by plan", "How many users signed up last month?", "Top 10 customers by spend", "Daily active users over time").
-  - Result panel: text summary, markdown table rendered (use `marked.js` CDN), chart `<img>` from base64.
-  - Loading spinner while waiting.
-  - "Ask another" button to reset.
-- `src/hex/web/tests/test_server.py` — 5 tests:
-  - `POST /api/ask` happy path returns 200 with text + chart_b64.
-  - Empty question → 422.
-  - Question >500 chars → 422.
-  - Brain error → 200 with `error` field set (graceful, not 500).
-  - `GET /healthz` → 200.
+- `src/hex/db/engine.py` — change signature to `__init__(self, *, seed: bool = True)`. Blank path still creates `_meta` row after loading so `health_check()` works.
+- `src/hex/db/csv_loader.py` (new) — pure CSV → SQLite loader with no IO, no LLM, no framework:
+  - `load_csv_into(conn, csv_bytes: bytes, filename_hint: str) -> LoadedTable`
+  - `sanitize_identifier(raw: str) -> str` — lowercase, non-alphanumeric → `_`, collapse dupes, strip edges, prefix `col_` if digit-leading
+  - `infer_column_types(sample_rows) -> list[str]` — INTEGER / REAL / TEXT
+  - Enforces 5 MB / 10k row / 50 col caps; raises `CSVValidationError` with a user-friendly message
+  - Returns `LoadedTable(table_name, columns=[{name, type}], row_count)`
+- `src/hex/shared/models.py` — add `LoadedTable` dataclass
+- `src/hex/shared/errors.py` — add `CSVValidationError(HexError)`
 
-### Entrypoint
+### Tests — `src/hex/db/tests/test_csv_loader.py`
 
-- `web_main.py` at repo root — mirrors `main.py` but skips Slack:
-  - Wires DB → Brain → Viz → AppOrchestrator (without `slack_client`, pass `None` or a no-op stub).
-  - Builds FastAPI app via `create_app(orchestrator)`.
-  - Runs uvicorn.
+- happy path: 3-col CSV loads, types inferred correctly
+- column name sanitization (`"First Name"` → `first_name`, `"2023"` → `col_2023`, duplicates dedup’d)
+- table name derived from filename, fallback to `data`
+- type inference across mixed-int-with-nulls, floats, dates-as-text
+- oversized file (>5MB) raises `CSVValidationError`
+- too-many-rows (>10k) raises with clear message
+- too-many-cols (>50) raises
+- malformed CSV (unclosed quote) raises `CSVValidationError` not generic crash
+- non-UTF8 encoding (latin-1) handled or rejected cleanly
+- empty CSV raises
+- single-row CSV (header only, no data) raises
 
-**Note:** `AppOrchestrator.__init__` currently requires `slack_client`. Adjust to `slack_client | None`, document that Slack-only methods will raise if called without it. Add one test for this.
+### Commit
 
-- [ ] Commit: `feat: add web/ module — FastAPI single-page demo UI`.
+`feat(db): blank-init SQLiteEngine + CSV loader with validation`
 
 ---
 
-## Phase 4 — Deploy-ready polish (45 min)
+## Phase 2 — Brain: opt-out of the SaaS glossary (20 min)
 
-- [ ] Add `Dockerfile` (slim Python 3.12, install via uv, runs `web_main.py`, exposes 8000).
-- [ ] Add `render.yaml` for one-click Render deploy with `ANTHROPIC_API_KEY` declared as required env var.
-- [ ] Add latency logging to `_compute_answer`: `logger.info("Pipeline: brain=%.2fs viz=%.2fs total=%.2fs", ...)`. Cheap observability that reads as production-minded.
-- [ ] Style sweep on existing matplotlib charts: apply seaborn theme + larger font + consistent palette so default output looks polished.
-- [ ] Commit: `feat: deployable Docker + render.yaml + chart styling polish`.
+The brain's semantic enrichment injects a SaaS glossary that's wrong for user data. Add a flag.
 
----
+### Files
 
-## Phase 5 — README rewrite (45 min)
+- `src/hex/brain/orchestrator.py` — `BrainOrchestrator.__init__` gains `use_glossary: bool = True`. When `False`, pass empty dict to `enrich()` or skip the glossary section of the prompt.
+- `src/hex/brain/semantic_layer.py` — inspect: if the function unconditionally injects the glossary, change to accept a flag or let the orchestrator skip the glossary prompt segment. Minimize surface area — prefer the orchestrator-side skip over mutating the enricher.
+- `src/hex/brain/tests/test_orchestrator.py` — one test: `use_glossary=False` → system prompt does not contain the glossary header.
 
-Rewrite `README.md` with this structure:
+### Commit
 
-1. **One-line pitch + live demo button + embedded GIF/screenshot** (top of file).
-2. **"Why this matters to Hex"** — one paragraph mapping the project to Hex's Fall 2025 agentic launch + Slack/Threads integration.
-3. **3-line quickstart**: clone, set `ANTHROPIC_API_KEY`, `uv run python web_main.py`.
-4. **ASCII architecture diagram** (request flow: Slack/Web → Gateway → AppOrchestrator → Brain → DB → Viz → response).
-5. **Module overview** — 6 modules, one line each.
-6. **Tech stack table**.
-7. **Testing** — `uv run pytest`, coverage stats.
-8. **What's next** — single-turn only, in-memory DB, no auth, no OTel. Honest scoping.
-9. **Slack setup** — collapsible `<details>` block at the bottom (no longer the headline flow).
-
-- [ ] Commit: `docs: rewrite README around live demo + Hex relevance`.
+`feat(brain): use_glossary flag for user-uploaded schemas`
 
 ---
 
-## Phase 6 — Final verification
+## Phase 3 — Orchestrator seam: brain override on compute_answer (20 min)
 
-- [ ] `uv run pytest` — all tests green (~130 expected).
-- [ ] `uv run python web_main.py` locally → open `http://localhost:8000`, click each sample question, verify text + table + chart all render.
-- [ ] `docker build . && docker run -p 8000:8000 -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY hex-bot` — confirm container runs end-to-end.
-- [ ] `git status` clean.
-- [ ] Commit: `chore: final verification before deploy`.
+Thread a single optional parameter through so the web layer can route a request to a session brain.
 
----
+### Files
 
-## What Larry needs to do manually
+- `src/hex/shared/interfaces.py` — `OrchestratorInterface.compute_answer(question, brain_override: BrainInterface | None = None)`
+- `src/hex/app/orchestrator.py` — accept the override; resolve with `brain = brain_override or self._brain`; everything else unchanged.
+- `src/hex/tests/test_compute_answer.py` — add one test: pass a stub brain override; verify it's called instead of `self._brain`.
 
-- [ ] **Pick a host.** Recommended: **Render.com** (free tier, GitHub auto-deploy, supports Python + Docker). Alternatives: Railway, Fly.io.
-- [ ] **Create Render account** and connect this repo. Render auto-detects `render.yaml`.
-- [ ] **Set env vars on Render dashboard:**
-  - `ANTHROPIC_API_KEY` = your key
-  - `CLAUDE_MODEL` = `claude-sonnet-4-6` (or whatever you've been testing with)
-- [ ] **First deploy.** Grab the public URL (e.g. `hex-bot-xyz.onrender.com`). Paste into the README "live demo" button at top.
-- [ ] **Optional but recommended: custom domain** (~$12/yr on Cloudflare Registrar or Namecheap). `hex-demo.larryzhang.dev` reads way more polished than the default Render subdomain.
-- [ ] **Record 90-sec demo video.** Use **Loom** (free, instant shareable link) or QuickTime + unlisted YouTube. Script:
-  - 0–10s: "I built a small agentic analytics bot inspired by Hex's Fall 2025 launch."
-  - 10–30s: Show **web UI** — click a sample question, watch it generate SQL + chart.
-  - 30–55s: Show **Slack** — same question, response in-thread with the chart.
-  - 55–80s: Quick code tour — 6-module separation, ~130 tests, async/sync boundaries.
-  - 80–90s: "Repo + live demo linked below. Would love to chat."
-- [ ] **Send to Hex leadership** with a 3-line message:
-  - Live demo link.
-  - Loom link.
-  - GitHub repo link.
+### Commit
+
+`refactor(app): compute_answer accepts optional brain_override`
 
 ---
 
-## Open decisions for Larry to confirm before I start
+## Phase 4 — Session manager (1 hr)
 
-1. **Web UI style:** single-shot Q&A panel (recommended for MVP) vs. chat-bubble back-and-forth. Multi-turn isn't supported on the backend, so chat bubbles would feel fake. Going with single-shot unless you say otherwise.
-2. **"Wow chart":** I'm skipping a multi-panel dashboard chart to stay MVP. Will instead apply seaborn styling to existing chart types so they look polished by default. Add the dashboard later if time allows.
-3. **Banner on web demo:** "Uses mock SaaS data" banner so leadership knows what to ask. Recommended yes.
-4. **AppOrchestrator without slack_client:** Allow `slack_client=None`. Methods that need Slack will raise. Documented and tested.
+The heart of isolation. Owns session_id → DatasetSession lifecycle with TTL + LRU.
+
+### Files
+
+- `src/hex/web/session.py` (new):
+  - `DatasetSession` dataclass: `session_id`, `created_at`, `last_used_at`, `db: SQLiteEngine`, `brain: BrainInterface`, `table_name`, `schema`, `row_count`
+  - `SessionManager`:
+    - `__init__(self, brain_factory, *, max_sessions=20, ttl_seconds=1800)`
+    - `create(loaded_table) -> DatasetSession` — builds DB, builds brain via `brain_factory(db)`, assigns UUID, stores, evicts if over cap
+    - `get(session_id) -> DatasetSession | None` — refreshes `last_used_at`; evicts expired lazily on access
+    - `delete(session_id) -> None` — explicit cleanup
+    - `_evict_expired()` / `_evict_lru()` — private, run on every create/get
+  - `brain_factory` is a callable `(db: DatabaseEngineInterface) -> BrainInterface` — inverted dependency so `SessionManager` has no imports from `brain/`. Web wiring composes it.
+
+### Tests — `src/hex/web/tests/test_session.py`
+
+- create returns a session with unique UUID
+- get returns the same session if not expired; returns None if never created
+- get refreshes `last_used_at`
+- expired session (past TTL) returns None on next get AND is removed from internal map
+- when at max_sessions, creating a new one evicts the LRU
+- delete removes the session
+- two parallel sessions have independent DBs (write to one, other unchanged — use raw SQL since our engine is read-only, or assert schema isolation)
+
+### Commit
+
+`feat(web): SessionManager with TTL + LRU eviction`
 
 ---
 
-## Out of scope (call out in README "What's Next")
+## Phase 5 — Web endpoints (1 hr)
 
-- Multi-turn / thread memory.
-- Postgres / Snowflake adapter (architecture supports the swap via `DatabaseEngineInterface`).
-- OpenTelemetry / proper observability beyond log lines.
-- Auth on the web UI (anyone with the link can ask questions and burn API budget — note this risk).
-- Performance benchmark suite.
-- New chart types beyond the existing 9.
+Add the three endpoints, wire session manager into `create_app`.
+
+### Files
+
+- `src/hex/web/config.py` — add `MAX_UPLOAD_BYTES = 5 * 1024 * 1024`, `SESSION_TTL_SECONDS = 1800`, `MAX_SESSIONS = 20`.
+- `src/hex/web/server.py`:
+  - `create_app(orchestrator, *, brain_factory, session_manager=None)` — construct a default `SessionManager` if none supplied.
+  - `POST /api/upload` — multipart `file` field. Body size guard (413 if over cap). Call `load_csv_into`, then `session_manager.create(loaded_table)`. Return `{session_id, table_name, schema: [{name, type}], row_count, preview_rows: list[dict]}` (first 5 rows for UI preview).
+  - `POST /api/ask` — body gains optional `session_id`. If present → resolve session → pass `session.brain` as `brain_override`. If session expired/missing → 410 Gone with a clear message.
+  - `DELETE /api/session/{session_id}` — 204 on success, 404 if not found.
+  - `GET /api/session/{session_id}` — read session metadata (table_name, schema, row_count); 404 if not found. Powers frontend state restore after reload.
+- `web_main.py` — define `def build_brain(db): return BrainOrchestrator(brain_config, db, llm_client, use_glossary=False)` and pass as `brain_factory` into `create_app`.
+
+### Tests — `src/hex/web/tests/test_server.py` (add to existing)
+
+- `POST /api/upload` happy path → 200 with session_id + schema
+- upload with oversized file → 413
+- upload with malformed CSV → 422 with `CSVValidationError` message
+- `POST /api/ask` with valid session_id → routes to session brain (mock brain_factory asserts)
+- `POST /api/ask` with unknown session_id → 410
+- `POST /api/ask` with no session_id → uses default brain (mock data)
+- `DELETE /api/session/{id}` → 204; subsequent ask with same id → 410
+- `GET /api/session/{id}` → 200 with metadata; unknown → 404
+- isolation integration: upload session A, upload session B, ask against A, verify B's data not referenced
+
+### Commit
+
+`feat(web): /api/upload, session-scoped /api/ask, session delete/get`
 
 ---
 
-## Review section (post-execution)
+## Phase 6 — Frontend (1 hr)
 
-**Status:** all 6 phases complete. 5 atomic commits on main. 137/137 tests passing (was 120 → +17 new: 6 for compute_answer, 11 for web). Tree clean.
+Upload UX in the single-page HTML. No build step, vanilla JS + Tailwind CDN.
 
-**What changed vs the original plan:**
-- Switched deploy target from Vercel → Render (Vercel's 10s serverless timeout would fail Anthropic + matplotlib cold starts; Render gives the same free `*.onrender.com` UX without the timeout problem).
-- Skipped the seaborn restyling pass — `viz/styling.py` already had a usable `professional_light` theme; respecting "simplicity first / touch minimal code."
-- Added 1 extra test (handle_question without slack_client raises) for safety.
-- Added a whitespace-only-question guard in `web/server.py` that pydantic alone wouldn't catch.
+### Files
 
-**Architectural decisions worth flagging:**
-- `AnswerResult` lives in `shared/models.py` (canonical types) so both `gateway/` and `web/` import it from the right place per the strict-boundary rule.
-- `AppOrchestrator(slack_client=None)` is allowed; `handle_question` raises if called without one. Loud failure beats silent half-baked response.
-- Web layer uses base64 PNG inline (not a separate `/chart/<id>` endpoint) because the demo is stateless and self-contained payloads are simpler than a chart-cache.
-- `asyncio.wait_for` in `/api/ask` so a hung LLM call can't pin a worker forever — important for an unauthenticated demo.
+- `src/hex/web/static/index.html`:
+  - Data source toggle at the top: "Sample dataset" (default, current pills visible) vs "Upload my own CSV"
+  - When "Upload" selected:
+    - drag-drop file zone + file input
+    - uploading spinner
+    - on success: show uploaded table name + schema preview (columns with types)
+    - sample question pills hidden (they reference mock schema)
+    - input placeholder changes to "Ask about your uploaded data..."
+    - "Start over" button: DELETE session, clear localStorage, revert to sample mode
+  - `session_id` stored in `localStorage.hex_session_id`; restored on load via `GET /api/session/{id}` (swallows 404 as "expired, go back to sample mode")
+  - `/api/ask` always sends `session_id` if present in localStorage
 
-**Known follow-ups (in README "What's Next"):**
-- Multi-turn / thread memory.
-- Real warehouse adapter (architecture supports it).
-- Auth on web UI (currently anyone with link burns API budget).
-- OpenTelemetry traces.
-- Question-hash cache.
+### Manual browser verification (no automated test for the HTML)
+
+- upload a sample CSV, ask a question against it, get an answer
+- reload mid-session → state restored
+- "Start over" → back to sample mode
+- expired session (manually clear server map or wait) → graceful fallback
+
+### Commit
+
+`feat(web): upload UI, schema preview, session restore`
+
+---
+
+## Phase 7 — Docs + deploy verification (30 min)
+
+### Files
+
+- `README.md`:
+  - New "Try with your own data" paragraph under the quickstart
+  - Mention session isolation + 5 MB / 10k row caps
+  - "What's Next" — update: real warehouse adapter still open, but user-upload is now shipped.
+- `src/hex/web/tests/conftest.py` / any shared fixture updates for tests.
+- Run full `uv run pytest src/hex` — verify the existing 137 pass + all new tests pass.
+- Local browser smoke test via `uv run python web_main.py`:
+  - Sample mode: click each pill, all answer correctly
+  - Upload a small CSV, ask a question, verify answer references uploaded columns
+- Commit: `docs: README — user upload path + session isolation`
+- Push; Render auto-deploy; verify live URL works end-to-end.
+
+---
+
+## Phase 8 — Post-execution review
+
+Fill in after shipping:
+
+- What changed vs plan (deviations, surprises)
+- Architectural calls worth flagging
+- Known follow-ups
+
+---
+
+## Open risk (documented, accepted for MVP)
+
+- **Memory pressure on Render free tier (512 MB).** 20 sessions × 5 MB = 100 MB worst case + matplotlib overhead. Acceptable; eviction handles the long tail. If we see OOM kills, lower `MAX_SESSIONS` first.
+- **Unauthenticated upload endpoint.** Anyone with the link can upload a 5 MB file up to 20× concurrent. Rate-limiting is out of scope; the Anthropic spend cap + Render's own request throttling are the real protection. Flagged in README.
+- **No CSV schema-change-after-upload.** A session's table is fixed. To change data, user clicks "Start over" → new session. Documented in UI.

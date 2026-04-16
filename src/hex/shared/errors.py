@@ -59,6 +59,16 @@ class QueryExecutionError(DatabaseError):
     """Runtime error during query execution (bad column, timeout, etc.)."""
 
 
+class CSVValidationError(HexError):
+    """Uploaded CSV failed parsing or exceeded a configured limit.
+
+    Raised by the CSV loader for any rejection the user can act on
+    (oversized, malformed, empty, non-UTF-8, too many columns/rows).
+    Deliberately separate from DatabaseError because the CSV never
+    reached SQL execution — it was rejected upstream.
+    """
+
+
 # ── Brain errors ──
 
 
