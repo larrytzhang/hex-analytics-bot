@@ -8,6 +8,7 @@ implementation files.
 from abc import ABC, abstractmethod
 
 from hex.shared.models import (
+    AnswerResult,
     BrainResponse,
     ChartRequest,
     ChartResult,
@@ -146,14 +147,34 @@ class OrchestratorInterface(ABC):
 
     @abstractmethod
     async def handle_question(self, request: SlackRequest) -> SlackResponse:
-        """Full pipeline: question -> Brain -> DB -> Viz -> SlackResponse.
+        """Full Slack pipeline: question -> Brain -> DB -> Viz -> SlackResponse.
 
-        This is the ONLY entry point the Gateway calls.
+        Convenience wrapper around compute_answer() that also performs
+        Slack-specific delivery (chart upload, thread reply formatting).
+        This is the entry point the Gateway calls.
 
         Args:
             request: Normalized SlackRequest from the gateway.
 
         Returns:
             SlackResponse ready to be sent back to the Slack channel.
+        """
+        ...
+
+    @abstractmethod
+    async def compute_answer(self, question: str) -> AnswerResult:
+        """Run the brain → viz pipeline for one question, transport-agnostic.
+
+        Does NOT touch Slack. Returns a plain AnswerResult that any I/O
+        surface (Slack gateway, web UI, future surfaces) can format.
+        This is the seam that lets the same brain pipeline serve both
+        Slack and a hosted web demo.
+
+        Args:
+            question: The user's plain-English data question.
+
+        Returns:
+            AnswerResult with text, optional query_result, optional
+            chart bytes, error message on failure, and latency measurement.
         """
         ...

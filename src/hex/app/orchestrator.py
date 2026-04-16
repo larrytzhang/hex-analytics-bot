@@ -1,16 +1,28 @@
 """App orchestrator — the central adapter layer.
 
 Implements OrchestratorInterface. This is the ONLY file that knows about
-all modules. Wires Gateway <-> Brain <-> Viz and translates between their
-data types. Does NOT receive db_engine — Brain owns DB access.
+all modules. Wires Brain <-> Viz and translates between their data types.
+Two entry points:
+
+* ``compute_answer(question)`` — transport-agnostic. Runs brain → viz
+  and returns a plain ``AnswerResult``. Used by the Web UI and by
+  ``handle_question`` below.
+* ``handle_question(SlackRequest)`` — Slack-specific. Calls
+  ``compute_answer`` and then performs Slack delivery (file upload,
+  thread reply formatting).
+
+Splitting the pipeline this way keeps brain/viz wiring in one place
+while letting any I/O surface reuse it without depending on Slack types.
 """
 
 import asyncio
 import logging
+import time
 
 from hex.shared.errors import BrainError, VisualizationError
 from hex.shared.interfaces import BrainInterface, ChartEngineInterface, OrchestratorInterface
 from hex.shared.models import (
+    AnswerResult,
     ChartRequest,
     ChartType,
     QueryResult,
@@ -23,57 +35,83 @@ logger = logging.getLogger(__name__)
 
 
 class AppOrchestrator(OrchestratorInterface):
-    """Top-level orchestrator wiring Brain, Viz, and Slack together.
+    """Top-level orchestrator wiring Brain, Viz, and (optionally) Slack.
 
     Receives BrainInterface and ChartEngineInterface via constructor injection.
     Does NOT receive DatabaseEngineInterface — Brain owns DB access internally.
+    The ``slack_client`` is optional so the same orchestrator can serve the
+    Slack gateway and the headless web UI from one wiring point.
 
     Attributes:
         _brain:  BrainInterface for question answering.
         _chart:  ChartEngineInterface for visualization.
-        _slack:  Slack AsyncWebClient for file uploads.
+        _slack:  Slack AsyncWebClient for file uploads, or None for non-Slack callers.
     """
 
-    def __init__(self, brain: BrainInterface, chart_engine: ChartEngineInterface, slack_client) -> None:
-        """Initialize the orchestrator with all dependencies.
+    def __init__(
+        self,
+        brain: BrainInterface,
+        chart_engine: ChartEngineInterface,
+        slack_client=None,
+    ) -> None:
+        """Initialize the orchestrator with brain, viz, and optional Slack client.
 
         Args:
             brain:        BrainInterface for processing questions.
             chart_engine: ChartEngineInterface for rendering charts.
-            slack_client: Slack AsyncWebClient for files_upload_v2.
+            slack_client: Slack AsyncWebClient. Optional — only required if
+                          ``handle_question`` is called. The web UI passes None.
         """
         self._brain = brain
         self._chart = chart_engine
         self._slack = slack_client
 
-    async def handle_question(self, request: SlackRequest) -> SlackResponse:
-        """Full pipeline: SlackRequest -> Brain -> Viz -> SlackResponse.
+    # ── Transport-agnostic pipeline ────────────────────────────────────────
+
+    async def compute_answer(self, question: str) -> AnswerResult:
+        """Run brain → viz once, return plain data with no Slack coupling.
+
+        Catches errors from each stage so the caller never has to. The
+        contract is: this method does not raise — failures land in
+        ``AnswerResult.error`` with a user-friendly message. That keeps
+        web/Slack callers simple and uniform.
 
         Args:
-            request: Normalized SlackRequest from the gateway.
+            question: Plain-English question from the user.
 
         Returns:
-            SlackResponse ready to be sent back to Slack.
+            AnswerResult with text_summary, optional query_result, optional
+            chart_bytes, optional error, and total latency in ms.
         """
-        question = request.clean_text
+        started = time.perf_counter()
 
-        # Step 1: Call Brain
+        # Stage 1 — Brain. Convert any BrainError into a friendly message.
         try:
             brain_response = await self._brain.ask(question)
         except BrainError as e:
-            return self._error_response(request, str(e))
-
-        # Step 2: Handle unanswerable questions
-        if brain_response.error or brain_response.query_result is None:
-            return SlackResponse(
-                channel_id=request.channel_id,
-                thread_ts=request.thread_ts,
-                text=brain_response.text_summary or "I can't answer that with the available data.",
+            elapsed = int((time.perf_counter() - started) * 1000)
+            logger.warning("compute_answer brain_error=%s latency_ms=%d", e, elapsed)
+            return AnswerResult(
+                text_summary="",
+                error=f"Something went wrong: {e}",
+                latency_ms=elapsed,
             )
 
-        # Step 3: Generate chart (if suggested)
-        chart_bytes = None
-        alt_text = ""
+        # Stage 2 — Unanswerable. Brain may legitimately return no data
+        # (e.g. question outside the schema). Surface the brain's text.
+        if brain_response.error or brain_response.query_result is None:
+            elapsed = int((time.perf_counter() - started) * 1000)
+            return AnswerResult(
+                text_summary=brain_response.text_summary
+                or "I can't answer that with the available data.",
+                error=brain_response.error,
+                latency_ms=elapsed,
+            )
+
+        # Stage 3 — Chart. Optional and non-fatal. If the LLM said NONE,
+        # skip. If viz raises, downgrade to text-only rather than failing
+        # the whole answer.
+        chart_bytes: bytes | None = None
         if brain_response.suggested_chart != ChartType.NONE:
             try:
                 chart_request = self._build_chart_request(
@@ -81,47 +119,90 @@ class AppOrchestrator(OrchestratorInterface):
                     brain_response.suggested_chart,
                     title=question,
                 )
-                # Wrap sync Viz call in async
+                # asyncio.to_thread because viz is sync (matplotlib).
                 chart_result = await asyncio.to_thread(self._chart.render, chart_request)
                 chart_bytes = chart_result.image_bytes
-                alt_text = brain_response.text_summary
-            except VisualizationError:
-                pass  # Chart failure is non-fatal
+            except VisualizationError as e:
+                logger.info("Chart skipped: %s", e)
 
-        # Step 4: Build text (truncate large results)
-        text = self._format_text_response(brain_response.text_summary, brain_response.query_result)
+        elapsed = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "compute_answer ok rows=%d chart=%s latency_ms=%d",
+            brain_response.query_result.row_count,
+            "yes" if chart_bytes else "no",
+            elapsed,
+        )
+        return AnswerResult(
+            text_summary=brain_response.text_summary,
+            query_result=brain_response.query_result,
+            chart_bytes=chart_bytes,
+            latency_ms=elapsed,
+        )
 
-        # Step 5: Upload chart to Slack if we have one
-        if chart_bytes:
+    # ── Slack-specific adapter ─────────────────────────────────────────────
+
+    async def handle_question(self, request: SlackRequest) -> SlackResponse:
+        """Slack adapter over compute_answer: also uploads chart in-thread.
+
+        Args:
+            request: Normalized SlackRequest from the gateway.
+
+        Returns:
+            SlackResponse ready for the Gateway to send back.
+        """
+        if self._slack is None:
+            # Defensive: handle_question requires a Slack client. If one
+            # was never injected, fail loudly rather than silently
+            # returning a half-baked response.
+            raise RuntimeError(
+                "AppOrchestrator.handle_question called without a slack_client; "
+                "use compute_answer() for non-Slack callers."
+            )
+
+        answer = await self.compute_answer(request.clean_text)
+
+        # Pipeline error → text-only error reply.
+        if answer.error and not answer.text_summary:
+            return SlackResponse(
+                channel_id=request.channel_id,
+                thread_ts=request.thread_ts,
+                response_type=ResponseType.TEXT,
+                text=answer.error,
+            )
+
+        # Format text + truncated table.
+        text = self._format_text_response(answer.text_summary, answer.query_result)
+
+        # Upload chart in-thread if we have one. Failure is non-fatal.
+        if answer.chart_bytes:
             try:
                 await self._slack.files_upload_v2(
                     channel=request.channel_id,
                     thread_ts=request.thread_ts,
-                    content=chart_bytes,
+                    content=answer.chart_bytes,
                     filename="chart.png",
-                    title=question,
-                    alt_text=alt_text,
+                    title=request.clean_text,
+                    alt_text=answer.text_summary,
+                )
+                return SlackResponse(
+                    channel_id=request.channel_id,
+                    thread_ts=request.thread_ts,
+                    response_type=ResponseType.TEXT_AND_IMAGE,
+                    text=text,
+                    image_bytes=answer.chart_bytes,
+                    alt_text=answer.text_summary,
                 )
             except Exception:
-                chart_bytes = None  # Degrade to text-only
                 logger.warning("Chart upload failed, degrading to text-only")
 
-            return SlackResponse(
-                channel_id=request.channel_id,
-                thread_ts=request.thread_ts,
-                response_type=ResponseType.TEXT_AND_IMAGE,
-                text=text,
-                image_bytes=chart_bytes,
-                alt_text=alt_text,
-            )
-
-        # Step 6: Text-only response
         return SlackResponse(
             channel_id=request.channel_id,
             thread_ts=request.thread_ts,
             response_type=ResponseType.TEXT,
             text=text,
         )
+
+    # ── Helpers ────────────────────────────────────────────────────────────
 
     def _build_chart_request(self, qr: QueryResult, chart_type: ChartType, title: str) -> ChartRequest:
         """Convert QueryResult -> ChartRequest for the Viz module.
@@ -136,12 +217,12 @@ class AppOrchestrator(OrchestratorInterface):
         """
         return ChartRequest(data=qr.to_dicts(), chart_type=chart_type, title=title)
 
-    def _format_text_response(self, summary: str, query_result: QueryResult) -> str:
-        """Format text with optional truncated table (max 10 rows).
+    def _format_text_response(self, summary: str, query_result: QueryResult | None) -> str:
+        """Format text with optional truncated markdown table (max 10 rows).
 
         Args:
             summary:      Plain-English answer text.
-            query_result: The query result to format.
+            query_result: The query result to format (may be None).
 
         Returns:
             Formatted text string with optional markdown table.
@@ -167,20 +248,3 @@ class AppOrchestrator(OrchestratorInterface):
         separator = "| " + " | ".join("---" for _ in columns) + " |"
         body = "\n".join("| " + " | ".join(str(v) for v in row) + " |" for row in rows)
         return f"{header}\n{separator}\n{body}"
-
-    def _error_response(self, request: SlackRequest, message: str) -> SlackResponse:
-        """Build a user-friendly error SlackResponse.
-
-        Args:
-            request: The original SlackRequest for channel/thread info.
-            message: Error message to display.
-
-        Returns:
-            SlackResponse with error text.
-        """
-        return SlackResponse(
-            channel_id=request.channel_id,
-            thread_ts=request.thread_ts,
-            response_type=ResponseType.TEXT,
-            text=f"Something went wrong: {message}",
-        )

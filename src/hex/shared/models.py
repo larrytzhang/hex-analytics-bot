@@ -242,6 +242,42 @@ class ChartResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+# ── ANSWER RESULT (transport-agnostic — shared by Gateway and Web) ──
+
+
+@dataclass
+class AnswerResult:
+    """Transport-agnostic output of the answer pipeline.
+
+    Returned by AppOrchestrator._compute_answer(). Consumed by both the
+    Slack gateway and the Web UI to format their respective responses.
+    Keeping this separate from SlackResponse means the brain → viz
+    pipeline can be reused by any I/O surface without leaking Slack
+    types into web/.
+
+    Attributes:
+        text_summary:  Plain-English answer text from the Brain.
+        query_result:  The QueryResult, or None when the question is
+                       unanswerable or the Brain raised.
+        chart_bytes:   Raw chart image bytes, or None when no chart was
+                       generated (Brain suggested NONE, viz failed,
+                       or the result was unsuitable for charting).
+        chart_mime:    MIME type of chart_bytes. Always "image/png" today.
+        error:         Human-friendly error message if the pipeline failed
+                       in a way the user should see, else None.
+        latency_ms:    Total wall-clock time for the pipeline in
+                       milliseconds. Useful for observability and demo
+                       transparency. Zero when not measured.
+    """
+
+    text_summary: str = ""
+    query_result: QueryResult | None = None
+    chart_bytes: bytes | None = None
+    chart_mime: str = "image/png"
+    error: str | None = None
+    latency_ms: int = 0
+
+
 # ── SLACK MODELS (used by Gateway + Orchestrator) ──
 
 
