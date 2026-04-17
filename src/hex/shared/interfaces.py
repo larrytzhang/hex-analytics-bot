@@ -162,7 +162,11 @@ class OrchestratorInterface(ABC):
         ...
 
     @abstractmethod
-    async def compute_answer(self, question: str) -> AnswerResult:
+    async def compute_answer(
+        self,
+        question: str,
+        brain_override: "BrainInterface | None" = None,
+    ) -> AnswerResult:
         """Run the brain → viz pipeline for one question, transport-agnostic.
 
         Does NOT touch Slack. Returns a plain AnswerResult that any I/O
@@ -172,6 +176,11 @@ class OrchestratorInterface(ABC):
 
         Args:
             question: The user's plain-English data question.
+            brain_override: Optional per-request brain. When set, used
+                instead of the orchestrator's default brain. The web
+                layer passes a session-scoped brain here so uploaded
+                CSV sessions route to their own DB; Slack passes None
+                and uses the shared mock-data brain.
 
         Returns:
             AnswerResult with text, optional query_result, optional

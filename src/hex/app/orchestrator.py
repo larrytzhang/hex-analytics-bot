@@ -68,7 +68,11 @@ class AppOrchestrator(OrchestratorInterface):
 
     # ── Transport-agnostic pipeline ────────────────────────────────────────
 
-    async def compute_answer(self, question: str) -> AnswerResult:
+    async def compute_answer(
+        self,
+        question: str,
+        brain_override: BrainInterface | None = None,
+    ) -> AnswerResult:
         """Run brain → viz once, return plain data with no Slack coupling.
 
         Catches errors from each stage so the caller never has to. The
@@ -84,10 +88,13 @@ class AppOrchestrator(OrchestratorInterface):
             chart_bytes, optional error, and total latency in ms.
         """
         started = time.perf_counter()
+        # Per-session override if supplied (web upload path); otherwise
+        # use the orchestrator's default brain (Slack + sample-data web).
+        brain = brain_override or self._brain
 
         # Stage 1 — Brain. Convert any BrainError into a friendly message.
         try:
-            brain_response = await self._brain.ask(question)
+            brain_response = await brain.ask(question)
         except BrainError as e:
             elapsed = int((time.perf_counter() - started) * 1000)
             logger.warning("compute_answer brain_error=%s latency_ms=%d", e, elapsed)
