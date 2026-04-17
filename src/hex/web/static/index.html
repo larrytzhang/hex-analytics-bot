@@ -131,12 +131,19 @@
 
     <script>
       // ── State ────────────────────────────────────────────────────────────
-      // Single source of truth: `sessionId` non-null means "upload mode,
-      // questions go against the uploaded table"; null means sample mode.
-      // localStorage persists across reloads so a refresh doesn't lose
-      // the user's uploaded context.
+      // Two independent dimensions, deliberately decoupled:
+      //   * `sessionId`  — the uploaded CSV exists on the server. Survives
+      //                    tab toggles; only cleared by Start over or a
+      //                    fresh upload. Persisted in localStorage so a
+      //                    refresh keeps the user's data.
+      //   * `currentMode` — which dataset the next question hits. Sample
+      //                    mode ignores any loaded CSV (but doesn't drop
+      //                    it). Upload mode requires a sessionId.
+      // The earlier design conflated the two and erased uploads on tab
+      // switch — see the bug retro in tasks/todo.md Phase 9.
       const STORAGE_KEY = "hex_session_id";
       let sessionId = localStorage.getItem(STORAGE_KEY);
+      let currentMode = "sample";
 
       const SAMPLES = [
         "Show monthly revenue by plan",
@@ -157,12 +164,16 @@
       });
 
       // ── Mode toggle ──────────────────────────────────────────────────────
-      // "sample" = no sessionId, pills visible, sample-dataset hint shown.
+      // "sample" = pills visible, sample-dataset hint shown, ask() ignores
+      //            any loaded CSV.
       // "upload" = upload panel visible; pills hidden (they don't apply to
-      // arbitrary schemas); placeholder nudges toward the uploaded table.
+      //            arbitrary schemas); ask() routes to the loaded session.
+      // Toggling NEVER deletes the session — that only happens via Start
+      // over or by uploading a replacement file.
 
       function setMode(mode) {
         const isUpload = mode === "upload";
+        currentMode = isUpload ? "upload" : "sample";
         $("mode-sample").classList.toggle("bg-slate-900", !isUpload);
         $("mode-sample").classList.toggle("text-white", !isUpload);
         $("mode-sample").classList.toggle("text-slate-600", isUpload);
@@ -175,19 +186,13 @@
         $("question").placeholder = isUpload
           ? "Ask about your uploaded data..."
           : "e.g. Show monthly revenue by plan";
+        // Hide the previous answer — its context (sample vs upload) no
+        // longer matches the active mode and would be misleading.
+        $("result").classList.add("hidden");
+        $("answer").classList.add("hidden");
       }
 
-      $("mode-sample").onclick = () => {
-        if (sessionId) {
-          // Switching back to sample implicitly abandons the upload —
-          // we explicitly delete so server memory is reclaimed.
-          fetch(`/api/session/${sessionId}`, { method: "DELETE" }).catch(() => {});
-          sessionId = null;
-          localStorage.removeItem(STORAGE_KEY);
-          $("table-summary").classList.add("hidden");
-        }
-        setMode("sample");
-      };
+      $("mode-sample").onclick = () => setMode("sample");
       $("mode-upload").onclick = () => setMode("upload");
 
       // ── Upload ──────────────────────────────────────────────────────────
@@ -215,6 +220,11 @@
         status.classList.remove("hidden");
         $("table-summary").classList.add("hidden");
 
+        // Replacing a CSV — drop the old server-side session explicitly
+        // so we don't leak it until TTL/LRU sweeps it. Fire-and-forget;
+        // the worst case is one orphaned session that ages out.
+        const previous = sessionId;
+
         const form = new FormData();
         form.append("file", file);
         try {
@@ -225,14 +235,33 @@
             status.className = "mt-4 text-sm text-red-700";
             return;
           }
+          if (previous && previous !== data.session_id) {
+            fetch(`/api/session/${previous}`, { method: "DELETE" }).catch(() => {});
+          }
           sessionId = data.session_id;
           localStorage.setItem(STORAGE_KEY, sessionId);
           renderSchema(data);
+          // Any prior answer pertained to a different dataset — wipe it.
+          $("result").classList.add("hidden");
+          $("answer").classList.add("hidden");
           status.classList.add("hidden");
         } catch (err) {
           status.textContent = "Network error: " + err.message;
           status.className = "mt-4 text-sm text-red-700";
         }
+      }
+
+      // ── Cell formatting ────────────────────────────────────────────────
+      // SQL aggregates over REAL columns produce IEEE-754 noise like
+      // ``8054.349999999999``. Round to 2 decimals for display while
+      // leaving integers, strings, and dates untouched. Nulls render as
+      // empty cells (not the literal string "null").
+      function formatCell(v) {
+        if (v === null || v === undefined) return "";
+        if (typeof v === "number" && !Number.isInteger(v)) {
+          return v.toFixed(2);
+        }
+        return String(v);
       }
 
       function renderSchema(data) {
@@ -254,7 +283,7 @@
           const tr = document.createElement("tr");
           data.columns.forEach((c) => {
             const td = document.createElement("td");
-            td.textContent = row[c.name] ?? "";
+            td.textContent = formatCell(row[c.name]);
             td.className = "px-3 py-2 text-slate-700 whitespace-nowrap";
             tr.appendChild(td);
           });
@@ -310,7 +339,10 @@
         $("ask").disabled = true;
 
         const body = { question: q };
-        if (sessionId) body.session_id = sessionId;
+        // Only attach the session when the upload tab is active. A loaded
+        // CSV stays in memory across tab toggles but doesn't shadow the
+        // sample dataset when the user is browsing it.
+        if (currentMode === "upload" && sessionId) body.session_id = sessionId;
 
         try {
           const res = await fetch("/api/ask", {
@@ -377,7 +409,7 @@
             const tr = document.createElement("tr");
             row.forEach((v) => {
               const td = document.createElement("td");
-              td.textContent = v;
+              td.textContent = formatCell(v);
               td.className = "px-3 py-2 text-slate-700";
               tr.appendChild(td);
             });

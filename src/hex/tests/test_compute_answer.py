@@ -185,3 +185,44 @@ async def test_handle_question_without_slack_client_raises():
     )
     with pytest.raises(RuntimeError, match="slack_client"):
         await orch.handle_question(request)
+
+
+# ── Cell formatting (Slack markdown table) ──────────────────────────────
+# Aggregates over REAL columns can produce IEEE-754 noise like
+# 8054.349999999999 — render-time formatting tames that without distorting
+# integer counts, strings, or dates.
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (8054.349999999999, "8054.35"),     # The reported bug.
+        (-0.1 - 0.2, "-0.30"),               # Classic FP artifact.
+        (42, "42"),                          # Integer untouched.
+        (42.0, "42.0"),                      # Whole-valued float untouched.
+        ("hello", "hello"),                  # Strings pass through.
+        ("2024-01-15", "2024-01-15"),        # Date strings pass through.
+        (None, ""),                          # NULL → empty cell.
+        (True, "True"),                      # Bool stays as repr.
+    ],
+)
+def test_format_cell(value, expected):
+    """`_format_cell` rounds non-integer floats to 2 dp; everything else is verbatim."""
+    assert AppOrchestrator._format_cell(value) == expected
+
+
+def test_markdown_table_rounds_floats():
+    """End-to-end: a row with FP-noise floats renders cleanly in the Slack table."""
+    brain = _brain_returning(BrainResponse(
+        text_summary="x", sql_used="", query_result=None, suggested_chart=ChartType.NONE,
+    ))
+    chart = _chart_returning_png()
+    orch = AppOrchestrator(brain, chart)
+    md = orch._markdown_table(
+        ["customer", "spend"],
+        [("Hayden", 8054.349999999999), ("Avery", 100)],
+    )
+    assert "8054.35" in md
+    assert "8054.349999" not in md
+    # Integer count unaffected.
+    assert "| 100 |" in md

@@ -244,6 +244,11 @@ class AppOrchestrator(OrchestratorInterface):
     def _markdown_table(self, columns: list[str], rows: list[tuple]) -> str:
         """Render columns + rows as a markdown table string.
 
+        Floats are rounded to 2 decimals to hide IEEE-754 noise from SUM/AVG
+        aggregates (e.g. ``8054.349999999999`` → ``8054.35``). Integers,
+        strings, and dates pass through untouched. Nulls render as empty
+        cells rather than the literal string "None".
+
         Args:
             columns: Column header names.
             rows:    Data rows as tuples.
@@ -253,5 +258,18 @@ class AppOrchestrator(OrchestratorInterface):
         """
         header = "| " + " | ".join(columns) + " |"
         separator = "| " + " | ".join("---" for _ in columns) + " |"
-        body = "\n".join("| " + " | ".join(str(v) for v in row) + " |" for row in rows)
+        body = "\n".join(
+            "| " + " | ".join(self._format_cell(v) for v in row) + " |"
+            for row in rows
+        )
         return f"{header}\n{separator}\n{body}"
+
+    @staticmethod
+    def _format_cell(v: object) -> str:
+        """Stringify a result cell for display, taming float precision."""
+        if v is None:
+            return ""
+        # bool is a subclass of int — keep True/False as-is, don't format.
+        if isinstance(v, float) and not v.is_integer():
+            return f"{v:.2f}"
+        return str(v)
