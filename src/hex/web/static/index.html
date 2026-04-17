@@ -12,6 +12,7 @@
       .pill:hover { transform: translateY(-1px); }
       .fade-in { animation: fade 200ms ease both; }
       @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+      .drop-active { background: #f1f5f9; border-color: #64748b; }
     </style>
   </head>
   <body class="bg-slate-50 text-slate-900 min-h-screen">
@@ -23,16 +24,54 @@
           <h1 class="text-2xl font-semibold tracking-tight">Hex Analytics Bot — Demo</h1>
         </div>
         <p class="text-slate-600 text-sm leading-relaxed">
-          Ask a plain-English question. The bot writes SQL, runs it on a mock SaaS dataset, and returns an answer plus a chart.
-          <span class="block mt-1 text-slate-500">
-            Mock schema: <code class="bg-slate-200 px-1 rounded">plans</code>,
-            <code class="bg-slate-200 px-1 rounded">users</code>,
-            <code class="bg-slate-200 px-1 rounded">subscriptions</code>,
-            <code class="bg-slate-200 px-1 rounded">invoices</code>,
-            <code class="bg-slate-200 px-1 rounded">events</code>.
-          </span>
+          Ask a plain-English question. The bot writes SQL, runs it, and returns an answer plus a chart.
         </p>
       </header>
+
+      <!-- Data source toggle -->
+      <section class="mb-6">
+        <div class="inline-flex rounded-lg border border-slate-200 bg-white p-1 text-sm">
+          <button id="mode-sample" class="px-4 py-1.5 rounded-md font-medium bg-slate-900 text-white">Sample dataset</button>
+          <button id="mode-upload" class="px-4 py-1.5 rounded-md font-medium text-slate-600 hover:text-slate-900">Upload my own CSV</button>
+        </div>
+      </section>
+
+      <!-- Sample schema hint -->
+      <section id="sample-hint" class="mb-4 text-sm text-slate-500">
+        Mock schema:
+        <code class="bg-slate-200 px-1 rounded">plans</code>,
+        <code class="bg-slate-200 px-1 rounded">users</code>,
+        <code class="bg-slate-200 px-1 rounded">subscriptions</code>,
+        <code class="bg-slate-200 px-1 rounded">invoices</code>,
+        <code class="bg-slate-200 px-1 rounded">events</code>.
+      </section>
+
+      <!-- Upload panel (hidden until toggle flips) -->
+      <section id="upload-panel" class="hidden mb-6 bg-white rounded-xl shadow-sm border border-slate-200 p-5 fade-in">
+        <div id="drop-zone" class="border-2 border-dashed border-slate-300 rounded-lg p-8 text-center cursor-pointer hover:bg-slate-50">
+          <p class="text-slate-700 font-medium">Drop a CSV here, or click to choose a file</p>
+          <p class="text-xs text-slate-500 mt-1">Max 5 MB · 10,000 rows · 50 columns</p>
+          <input id="file-input" type="file" accept=".csv,text/csv" class="hidden" />
+        </div>
+        <div id="upload-status" class="hidden mt-4 text-sm"></div>
+
+        <!-- Loaded table preview -->
+        <div id="table-summary" class="hidden mt-5">
+          <div class="flex items-center justify-between mb-2">
+            <div>
+              <p class="text-sm font-medium text-slate-800">Loaded: <span id="loaded-name" class="font-mono"></span></p>
+              <p class="text-xs text-slate-500" id="loaded-count"></p>
+            </div>
+            <button id="start-over" class="text-sm text-slate-600 hover:text-slate-900 underline">Start over</button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="min-w-full text-xs border border-slate-200 rounded-lg overflow-hidden">
+              <thead class="bg-slate-100 text-slate-700"><tr id="schema-head"></tr></thead>
+              <tbody id="schema-body" class="divide-y divide-slate-200"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
 
       <!-- Input -->
       <section class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 mb-6">
@@ -52,7 +91,7 @@
         </div>
 
         <!-- Sample question pills -->
-        <div class="mt-4">
+        <div id="samples-wrap" class="mt-4">
           <p class="text-xs uppercase tracking-wide text-slate-500 mb-2">Try one of these</p>
           <div id="samples" class="flex flex-wrap gap-2"></div>
         </div>
@@ -86,14 +125,19 @@
       </section>
 
       <footer class="mt-10 text-xs text-slate-400 text-center">
-        Built as a portfolio demo · Single-turn, in-memory SQLite, no auth ·
-        <a class="underline" href="https://github.com/" target="_blank" rel="noreferrer">repo</a>
+        Built as a portfolio demo · Single-turn, in-memory SQLite, no auth
       </footer>
     </div>
 
     <script>
-      // Sample questions chosen to exercise different chart types and to
-      // map cleanly onto the mock SaaS schema.
+      // ── State ────────────────────────────────────────────────────────────
+      // Single source of truth: `sessionId` non-null means "upload mode,
+      // questions go against the uploaded table"; null means sample mode.
+      // localStorage persists across reloads so a refresh doesn't lose
+      // the user's uploaded context.
+      const STORAGE_KEY = "hex_session_id";
+      let sessionId = localStorage.getItem(STORAGE_KEY);
+
       const SAMPLES = [
         "Show monthly revenue by plan",
         "How many users signed up last month?",
@@ -103,16 +147,156 @@
 
       const $ = (id) => document.getElementById(id);
 
-      // Render sample pills.
-      const samples = $("samples");
+      // Render sample pills once.
       SAMPLES.forEach((q) => {
         const b = document.createElement("button");
         b.textContent = q;
         b.className = "pill text-sm px-3 py-1.5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-700";
         b.onclick = () => { $("question").value = q; ask(); };
-        samples.appendChild(b);
+        $("samples").appendChild(b);
       });
 
+      // ── Mode toggle ──────────────────────────────────────────────────────
+      // "sample" = no sessionId, pills visible, sample-dataset hint shown.
+      // "upload" = upload panel visible; pills hidden (they don't apply to
+      // arbitrary schemas); placeholder nudges toward the uploaded table.
+
+      function setMode(mode) {
+        const isUpload = mode === "upload";
+        $("mode-sample").classList.toggle("bg-slate-900", !isUpload);
+        $("mode-sample").classList.toggle("text-white", !isUpload);
+        $("mode-sample").classList.toggle("text-slate-600", isUpload);
+        $("mode-upload").classList.toggle("bg-slate-900", isUpload);
+        $("mode-upload").classList.toggle("text-white", isUpload);
+        $("mode-upload").classList.toggle("text-slate-600", !isUpload);
+        $("upload-panel").classList.toggle("hidden", !isUpload);
+        $("sample-hint").classList.toggle("hidden", isUpload);
+        $("samples-wrap").classList.toggle("hidden", isUpload);
+        $("question").placeholder = isUpload
+          ? "Ask about your uploaded data..."
+          : "e.g. Show monthly revenue by plan";
+      }
+
+      $("mode-sample").onclick = () => {
+        if (sessionId) {
+          // Switching back to sample implicitly abandons the upload —
+          // we explicitly delete so server memory is reclaimed.
+          fetch(`/api/session/${sessionId}`, { method: "DELETE" }).catch(() => {});
+          sessionId = null;
+          localStorage.removeItem(STORAGE_KEY);
+          $("table-summary").classList.add("hidden");
+        }
+        setMode("sample");
+      };
+      $("mode-upload").onclick = () => setMode("upload");
+
+      // ── Upload ──────────────────────────────────────────────────────────
+      // Drag-drop zone forwards to the hidden <input type=file>. Keeping
+      // the real upload path in one function means we don't drift between
+      // drag and click.
+
+      const drop = $("drop-zone");
+      drop.onclick = () => $("file-input").click();
+      drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("drop-active"); };
+      drop.ondragleave = () => drop.classList.remove("drop-active");
+      drop.ondrop = (e) => {
+        e.preventDefault();
+        drop.classList.remove("drop-active");
+        if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+      };
+      $("file-input").onchange = (e) => {
+        if (e.target.files[0]) upload(e.target.files[0]);
+      };
+
+      async function upload(file) {
+        const status = $("upload-status");
+        status.textContent = `Uploading ${file.name}…`;
+        status.className = "mt-4 text-sm text-slate-600";
+        status.classList.remove("hidden");
+        $("table-summary").classList.add("hidden");
+
+        const form = new FormData();
+        form.append("file", file);
+        try {
+          const res = await fetch("/api/upload", { method: "POST", body: form });
+          const data = await res.json();
+          if (!res.ok) {
+            status.textContent = data.error || `Upload failed (${res.status})`;
+            status.className = "mt-4 text-sm text-red-700";
+            return;
+          }
+          sessionId = data.session_id;
+          localStorage.setItem(STORAGE_KEY, sessionId);
+          renderSchema(data);
+          status.classList.add("hidden");
+        } catch (err) {
+          status.textContent = "Network error: " + err.message;
+          status.className = "mt-4 text-sm text-red-700";
+        }
+      }
+
+      function renderSchema(data) {
+        $("loaded-name").textContent = data.table_name;
+        $("loaded-count").textContent = `${data.row_count.toLocaleString()} rows · ${data.columns.length} columns`;
+
+        const head = $("schema-head");
+        head.innerHTML = "";
+        data.columns.forEach((c) => {
+          const th = document.createElement("th");
+          th.textContent = `${c.name} (${c.type.toLowerCase()})`;
+          th.className = "px-3 py-2 text-left font-semibold";
+          head.appendChild(th);
+        });
+
+        const body = $("schema-body");
+        body.innerHTML = "";
+        (data.preview_rows || []).forEach((row) => {
+          const tr = document.createElement("tr");
+          data.columns.forEach((c) => {
+            const td = document.createElement("td");
+            td.textContent = row[c.name] ?? "";
+            td.className = "px-3 py-2 text-slate-700 whitespace-nowrap";
+            tr.appendChild(td);
+          });
+          body.appendChild(tr);
+        });
+        $("table-summary").classList.remove("hidden");
+      }
+
+      $("start-over").onclick = () => {
+        if (!sessionId) return;
+        fetch(`/api/session/${sessionId}`, { method: "DELETE" }).catch(() => {});
+        sessionId = null;
+        localStorage.removeItem(STORAGE_KEY);
+        $("table-summary").classList.add("hidden");
+        $("upload-status").classList.add("hidden");
+        $("file-input").value = "";
+      };
+
+      // ── Restore on load ────────────────────────────────────────────────
+      // If localStorage has a session id, ask the server to confirm it's
+      // still alive. 404 means it expired server-side — fall back to
+      // sample mode silently so reviewers don't see a dead-end screen.
+      (async function restore() {
+        if (!sessionId) return;
+        try {
+          const res = await fetch(`/api/session/${sessionId}`);
+          if (res.ok) {
+            const data = await res.json();
+            renderSchema(data);
+            setMode("upload");
+          } else {
+            localStorage.removeItem(STORAGE_KEY);
+            sessionId = null;
+          }
+        } catch {
+          // Network hiccup during restore — silently stay on sample mode.
+          localStorage.removeItem(STORAGE_KEY);
+          sessionId = null;
+        }
+      })();
+
+      // ── Ask ────────────────────────────────────────────────────────────
       $("ask").onclick = ask;
       $("question").addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
 
@@ -125,14 +309,26 @@
         $("answer").classList.add("hidden");
         $("ask").disabled = true;
 
+        const body = { question: q };
+        if (sessionId) body.session_id = sessionId;
+
         try {
           const res = await fetch("/api/ask", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question: q }),
+            body: JSON.stringify(body),
           });
           const data = await res.json();
-          render(data);
+          if (res.status === 410) {
+            // Server evicted the session between upload and ask — clear
+            // our local state and nudge the user to re-upload.
+            localStorage.removeItem(STORAGE_KEY);
+            sessionId = null;
+            $("table-summary").classList.add("hidden");
+            render({ text: "", error: data.error || "Your uploaded session expired. Please upload again." });
+          } else {
+            render(data);
+          }
         } catch (err) {
           render({ text: "", error: "Network error: " + err.message });
         } finally {
@@ -143,7 +339,6 @@
       }
 
       function render(data) {
-        // Error banner if present.
         const errBox = $("error-box");
         if (data.error) {
           errBox.textContent = data.error;
@@ -159,7 +354,6 @@
         if (tableStart !== -1) text = text.slice(0, tableStart).trim();
         $("text").textContent = text;
 
-        // Chart.
         if (data.chart_b64) {
           $("chart").src = `data:${data.chart_mime || "image/png"};base64,${data.chart_b64}`;
           $("chart").alt = text.slice(0, 120);
@@ -168,7 +362,6 @@
           $("chart-wrap").classList.add("hidden");
         }
 
-        // Table.
         if (data.columns && data.columns.length && data.rows && data.rows.length) {
           const headRow = $("thead-row");
           headRow.innerHTML = "";
