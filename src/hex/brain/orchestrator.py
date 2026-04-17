@@ -48,6 +48,8 @@ class BrainOrchestrator(BrainInterface):
         config: BrainConfig,
         db_engine: DatabaseEngineInterface,
         llm_client: LLMClient,
+        *,
+        use_glossary: bool = True,
     ) -> None:
         """Initialize the Brain orchestrator with all dependencies.
 
@@ -55,10 +57,15 @@ class BrainOrchestrator(BrainInterface):
             config:    BrainConfig with model and retry settings.
             db_engine: Database engine for schema access and query execution.
             llm_client: LLM client for Claude API interaction.
+            use_glossary: When True (default) inject the SaaS business
+                glossary (MRR, churn, DAU...) into the system prompt.
+                Set False for user-uploaded CSVs — the glossary would
+                just be noise against an arbitrary schema.
         """
         self._config = config
         self._db = db_engine
         self._llm = llm_client
+        self._use_glossary = use_glossary
         self._retry_handler = RetryHandler(
             db_engine=db_engine,
             llm_client=llm_client,
@@ -91,7 +98,10 @@ class BrainOrchestrator(BrainInterface):
 
             # Step 3: Build prompts
             schema_text = self._format_schema(context)
-            glossary_text = self._format_glossary(context)
+            # Empty glossary for user-uploaded data — the SaaS terms
+            # (MRR, churn) would just mislead the LLM against an
+            # arbitrary schema it has no context for.
+            glossary_text = self._format_glossary(context) if self._use_glossary else ""
             system_prompt = self._llm.build_system_prompt(schema_text, glossary_text)
             user_prompt = self._llm.build_user_prompt(question)
 
