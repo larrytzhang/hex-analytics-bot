@@ -206,11 +206,26 @@ Upload UX in the single-page HTML. No build step, vanilla JS + Tailwind CDN.
 
 ## Phase 8 — Post-execution review
 
-Fill in after shipping:
+**Outcome:** All 8 phases complete. 207/207 tests passing (up from 137 baseline — 70 new tests across `db/csv_loader`, `web/session`, `web/server`, plus the brain glossary flag test and the app-orchestrator brain_override test).
 
-- What changed vs plan (deviations, surprises)
-- Architectural calls worth flagging
-- Known follow-ups
+**Deviations from plan:**
+
+- Session manager's `create()` now accepts `(csv_bytes, filename_hint)` and does the CSV load internally, rather than taking a pre-parsed `LoadedTable`. Keeps the upload endpoint a two-liner and centralizes the "parse + build brain + register" flow.
+- `DatasetSession` stores the full `LoadedTable` (table_name, schema, row_count, preview_rows) rather than flat fields — simpler because the upload/GET endpoints return the same shape.
+- `web_main.py` constructs one shared `BrainConfig` + `LLMClient` and closes over them in the `brain_factory` so every session brain reuses the HTTP pool.
+- Added a `python-multipart` dependency (required by FastAPI's `UploadFile`).
+
+**Architectural calls worth flagging:**
+
+- `/api/upload` reads the body with a `MAX_UPLOAD_BYTES + 1` cap before handing bytes to the CSV loader — defense in depth so a pathological client can't allocate 10 GB before the loader's own 5 MB check fires.
+- Unknown `session_id` on `/api/ask` returns **410 Gone** (session expired semantic); unknown id on `GET /api/session/{id}` returns **404** (pure lookup semantic). Distinction matters because the UI restores state on load via GET and needs to differentiate "never existed" from "expired mid-session."
+- LRU eviction is implicit via `OrderedDict.move_to_end` on every `get()`; no explicit LRU list needed.
+
+**Known follow-ups (out of scope for this MVP):**
+
+- No auth on the upload endpoint — intentional for the demo, flagged in the README.
+- Sessions live only in memory; a container restart drops them. Fine for a demo on Render's ephemeral disk, but a real product would persist to a shared store.
+- No rate-limiting on uploads. The 20-session cap + 5 MB limit bounds abuse, but a determined attacker could churn sessions. Render's built-in throttling is the real backstop.
 
 ---
 

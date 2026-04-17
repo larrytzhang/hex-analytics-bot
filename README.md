@@ -49,6 +49,22 @@ uv run python web_main.py
 
 That's it. Mock SaaS data is seeded into in-memory SQLite at startup.
 
+### Try it with your own data
+
+The web demo also accepts CSV uploads. Click **"Upload my own CSV"** at the
+top of the page, drop a file in, and ask questions about it directly. Each
+browser gets an isolated in-memory session so two people clicking through
+the demo at the same time don't see each other's data.
+
+Limits (enforced server-side):
+
+- **5 MB** per file
+- **10,000 rows** max
+- **50 columns** max
+- Sessions expire after 30 minutes of inactivity or when the server is at
+  capacity (LRU eviction, 20 concurrent sessions). Click **"Start over"** to
+  clear the session explicitly.
+
 To run the **Slack** version locally, see [`docs/slack-setup.md`](#slack-setup)
 at the bottom.
 
@@ -140,7 +156,7 @@ duplication.
 
 ## Tests
 
-137 tests across the six modules. Run:
+207 tests across the six modules. Run:
 
 ```bash
 uv run pytest src/hex
@@ -189,7 +205,8 @@ were left out so the demo stays one weekend's work.
   conversation-history store.
 - **Real warehouse adapter.** The `DatabaseEngineInterface` is already there;
   swap `SQLiteEngine` for a Postgres or Snowflake adapter and the rest of
-  the system doesn't change.
+  the system doesn't change. (User CSV upload, a smaller version of the
+  same idea, is already shipped — see above.)
 - **Auth on the web UI.** The hosted demo is unauthenticated — anyone with
   the link can ask questions and burn API budget. Fine for a demo, not
   fine for prod.
