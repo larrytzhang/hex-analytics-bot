@@ -47,52 +47,60 @@
       </section>
 
       <!-- Upload panel (hidden until toggle flips) -->
-      <section id="upload-panel" class="hidden mb-6 bg-white rounded-xl shadow-sm border border-slate-200 p-5 fade-in">
+      <section id="upload-panel" class="hidden relative mb-6 bg-white rounded-xl shadow-sm border border-slate-200 p-5 fade-in">
         <!--
-          Mock-CSV hint — lowers friction for a cold reviewer who doesn't
-          have their own CSV handy. Absolutely positioned top-right over
-          the drop zone, with a curved arrow pointing into it. Supports
-          both drag-and-drop (preferred, feels like a real file move) and
-          click (fallback for touch devices and anyone who doesn't catch
-          the drag affordance). Visible only inside this panel, so it
-          auto-hides in sample mode without any extra toggle logic.
+          Mock-CSV hint — floats OUTSIDE the card in the grey page
+          background, anchored above-right of the upload panel. Absolute
+          positioning with a negative top offset pulls it up past the
+          card's top border; the parent section has `relative` so the
+          coordinate system stays scoped. The card's visible size is
+          unchanged because absolute children are removed from flow.
+          The arrow starts at the bottom-left of the label and curves
+          down-left, crossing both the white card border and the dashed
+          drop-zone border — the tip lands inside the drop zone so the
+          "this is where it lands" metaphor is unambiguous. Click + drag
+          both route through loadMockCsv(). Auto-hides in sample mode
+          since it lives inside the hidden upload-panel.
         -->
-        <div class="relative">
-          <div id="mock-hint"
-               draggable="true"
-               role="button"
-               tabindex="0"
-               title="Drag into the box, or click to load"
-               class="absolute right-0 -top-1 z-10 flex flex-col items-end select-none cursor-grab active:cursor-grabbing group">
-            <span class="text-sm italic text-slate-500 group-hover:text-slate-800 transition-colors pr-1">Try this CSV</span>
-            <!--
-              Hand-drawn-feeling arrow: a single asymmetric cubic bezier
-              plus a two-stroke arrowhead. Slight wobble in the control
-              points is deliberate — a perfectly symmetric curve reads
-              machine-drawn. Stroke inherits currentColor so the hover
-              state darkens it in sync with the label.
-            -->
-            <!--
-              pointer-events: none on the decorative SVG so dragover
-              events for REAL files passing over the arrow fall through
-              to the drop zone underneath — otherwise the arrow would
-              shadow the top-right corner of the drop target. The text
-              label above stays interactive, which is all the user needs
-              to initiate the mock-csv drag.
-            -->
-            <svg width="84" height="46" viewBox="0 0 84 46" fill="none" aria-hidden="true"
-                 class="text-slate-400 group-hover:text-slate-700 transition-colors -mr-1 pointer-events-none">
-              <path d="M 74 4 C 64 18, 40 22, 14 38"
-                    stroke="currentColor" stroke-width="1.5"
-                    stroke-linecap="round" fill="none"/>
-              <path d="M 14 38 L 23 33"
-                    stroke="currentColor" stroke-width="1.5"
-                    stroke-linecap="round" fill="none"/>
-              <path d="M 14 38 L 21 44"
-                    stroke="currentColor" stroke-width="1.5"
-                    stroke-linecap="round" fill="none"/>
-            </svg>
-          </div>
+        <div id="mock-hint"
+             role="button"
+             tabindex="0"
+             title="Drag the label into the box, or click to load"
+             class="absolute -top-8 right-10 z-10 flex flex-col items-end select-none cursor-pointer group">
+          <!--
+            Only the LABEL is draggable, not the whole hint. This makes
+            the browser's native drag image contain just the text — the
+            arrow stays anchored while the words float with the cursor,
+            reading as "pick up this label, drop it in the box". The
+            click + keyboard handlers still live on the parent so the
+            arrow is also clickable as a fallback.
+          -->
+          <span id="mock-hint-label"
+                draggable="true"
+                class="text-sm italic text-slate-500 group-hover:text-slate-800 transition-colors cursor-grab active:cursor-grabbing">Try this CSV</span>
+          <!--
+            Scribble-style arrow. Rather than one smooth bezier, the
+            curve is stitched from four short cubic segments with
+            alternating micro-wobble in the control points. Each
+            inflection adds a tiny overshoot, which reads as "drawn
+            with a pen in a hurry" instead of machine-smooth. Path
+            still starts at ~(25, 2) — the label's bottom-left once
+            both children are right-aligned — and lands at (8, 82)
+            inside the drop zone. Stroke-linejoin=round keeps the
+            segment joints from looking like corners.
+          -->
+          <svg width="110" height="90" viewBox="0 0 110 90" fill="none" aria-hidden="true"
+               class="text-slate-400 group-hover:text-slate-700 transition-colors -mt-1">
+            <path d="M 25 2 C 22 8, 19 16, 17 22 C 15 30, 19 38, 14 46 C 9 54, 13 62, 10 70 C 7 76, 11 80, 8 82"
+                  stroke="currentColor" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+            <path d="M 8 82 L 3 75"
+                  stroke="currentColor" stroke-width="1.5"
+                  stroke-linecap="round" fill="none"/>
+            <path d="M 8 82 L 15 76"
+                  stroke="currentColor" stroke-width="1.5"
+                  stroke-linecap="round" fill="none"/>
+          </svg>
         </div>
 
         <div id="drop-zone" class="border-2 border-dashed border-slate-300 rounded-lg p-8 text-center cursor-pointer hover:bg-slate-50">
@@ -289,10 +297,16 @@
       // Keyboard Enter/Space mirrors click for a11y — the element is
       // role=button + tabindex=0 in the markup.
       const mockHint = $("mock-hint");
-      mockHint.addEventListener("dragstart", (e) => {
+      const mockHintLabel = $("mock-hint-label");
+      // Drag source is the label element only — the arrow SVG stays
+      // anchored because it isn't draggable and therefore isn't part
+      // of the native drag image the browser generates on dragstart.
+      mockHintLabel.addEventListener("dragstart", (e) => {
         e.dataTransfer.setData("text/x-hex-mock-csv", "1");
         e.dataTransfer.effectAllowed = "copy";
       });
+      // Click + keyboard stay on the wrapper so the arrow is also a
+      // valid tap target (touch devices won't drag anyway).
       mockHint.addEventListener("click", () => loadMockCsv());
       mockHint.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); loadMockCsv(); }
