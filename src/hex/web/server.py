@@ -94,7 +94,36 @@ def create_app(
         Configured FastAPI app.
     """
     cfg = config or WebConfig()
-    app = FastAPI(title="Hex Analytics Bot — Demo", version="0.1.0")
+    # Disable the auto-generated OpenAPI + Swagger/ReDoc pages. The demo
+    # is public and unauthenticated; exposing a full schema of /api/ask,
+    # /api/upload, and /api/session/* is pure attack surface with no
+    # legitimate reviewer value — they interact via the single-page UI.
+    app = FastAPI(
+        title="Hex Analytics Bot — Demo",
+        version="0.1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    # Defense-in-depth security headers on every response. These are
+    # cheap (microseconds, no deps) and close three classes of low-hanging
+    # browser-side issues without touching the CSS/JS pipeline:
+    #   * nosniff      — stop MIME-sniffing an API JSON body as HTML/JS.
+    #   * Referrer-Policy — don't leak full demo URLs (with any query
+    #                   strings we might add later) to third parties.
+    #   * X-Frame-Options — prevent click-jacking by refusing to render
+    #                   the demo inside a third-party iframe.
+    # CSP is deliberately omitted: index.html uses the Tailwind CDN and
+    # inline styles, so a correct CSP is more work than the risk warrants
+    # for a portfolio demo.
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        return response
 
     # Mount static assets at /static so the index.html can pull in CSS/JS
     # by relative path. Index page itself is served from "/" explicitly

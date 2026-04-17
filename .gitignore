@@ -46,3 +46,9 @@ nextsteps.txt
 *.local.txt
 plans/
 "plans folder/"
+
+# Local sample CSVs used for manual upload testing — not part of the repo.
+# Anything the user drops in to try the /api/upload path lives here
+# transiently; don't leak it into git.
+MOCK.csv
+*.sample.csv

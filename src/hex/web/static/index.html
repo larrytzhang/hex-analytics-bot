@@ -101,7 +101,7 @@
       <section id="result" class="hidden bg-white rounded-xl shadow-sm border border-slate-200 p-5 fade-in">
         <div id="loading" class="hidden flex items-center gap-3 text-slate-600">
           <div class="w-4 h-4 border-2 border-slate-300 border-t-slate-900 rounded-full animate-spin"></div>
-          <span>Thinking…</span>
+          <span id="loading-text">Thinking…</span>
         </div>
 
         <div id="answer" class="hidden">
@@ -153,6 +153,15 @@
       ];
 
       const $ = (id) => document.getElementById(id);
+
+      // ── Cold-start warm-up ───────────────────────────────────────────────
+      // Render's free tier spins the container down after ~15 min idle; the
+      // next request pays a 30–60s cold start. The user typically spends a
+      // few seconds orienting on this page before clicking anything, so we
+      // fire /healthz the moment the script parses to hide most of that
+      // latency behind their reading time. Fire-and-forget — the ask()
+      // path has its own messaging for the residual case.
+      fetch("/healthz").catch(() => {});
 
       // Render sample pills once.
       SAMPLES.forEach((q) => {
@@ -338,6 +347,21 @@
         $("answer").classList.add("hidden");
         $("ask").disabled = true;
 
+        // Progressive loading copy. If the warm-up ping didn't finish in
+        // time and the user hits a cold container, these swaps make it
+        // explicit that the wait is Render's free tier spinning up, not
+        // the app being slow. The request itself runs to completion
+        // regardless — this is pure cosmetic attribution.
+        const loadingText = $("loading-text");
+        loadingText.textContent = "Thinking…";
+        const t5 = setTimeout(() => {
+          loadingText.textContent =
+            "Render is waking the server from its free-tier sleep — only happens on the first question.";
+        }, 5000);
+        const t20 = setTimeout(() => {
+          loadingText.textContent = "Almost there — spinning up the container…";
+        }, 20000);
+
         const body = { question: q };
         // Only attach the session when the upload tab is active. A loaded
         // CSV stays in memory across tab toggles but doesn't shadow the
@@ -364,6 +388,11 @@
         } catch (err) {
           render({ text: "", error: "Network error: " + err.message });
         } finally {
+          // Cancel the cosmetic swaps before the next ask starts — if we
+          // left them pending, a 3s response followed by a 6s-later "waking
+          // up" swap would show stale copy on a hidden spinner.
+          clearTimeout(t5);
+          clearTimeout(t20);
           $("loading").classList.add("hidden");
           $("answer").classList.remove("hidden");
           $("ask").disabled = false;

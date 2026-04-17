@@ -4,9 +4,15 @@
 > Ask a plain-English question; it writes SQL, runs it, charts the result,
 > and answers in your browser or in Slack.
 
-**[ Live demo →   `<paste-render-url-here>` ]**   ·   **[ 90-sec video →   `<paste-loom-url-here>` ]**
+**Live demo → <https://hex-analytics-bot.onrender.com>**
 
-![demo screenshot — replace with a real PNG/GIF](docs/demo.png)
+Sample questions the demo handles well:
+
+- "Show monthly revenue by plan"
+- "How many users signed up last month?"
+- "Top 10 customers by total spend"
+- "Daily active users over time"
+- "What's the churn rate by plan?"
 
 ---
 
@@ -185,100 +191,5 @@ In-memory SQLite re-seeds on every cold start (`seed=42`, deterministic):
 | `invoices` | ~200 | Billing records |
 | `events` | 500 | User activity (logins, page views, etc.) |
 
-Sample questions the demo handles well:
 
-- "Show monthly revenue by plan"
-- "How many users signed up last month?"
-- "Top 10 customers by total spend"
-- "Daily active users over time"
-- "What's the churn rate by plan?"
-
----
-
-## What's next (intentionally not in this MVP)
-
-Honest scoping. None of these are hard given the existing architecture; they
-were left out so the demo stays one weekend's work.
-
-- **Multi-turn / thread memory.** Right now every question is single-shot.
-  Real users follow up ("now break that down by region"). Brain needs a
-  conversation-history store.
-- **Real warehouse adapter.** The `DatabaseEngineInterface` is already there;
-  swap `SQLiteEngine` for a Postgres or Snowflake adapter and the rest of
-  the system doesn't change. (User CSV upload, a smaller version of the
-  same idea, is already shipped — see above.)
-- **Auth on the web UI.** The hosted demo is unauthenticated — anyone with
-  the link can ask questions and burn API budget. Fine for a demo, not
-  fine for prod.
-- **Proper observability.** Today the orchestrator logs latency per
-  pipeline; OpenTelemetry traces would make it easier to see where time
-  goes (LLM vs DB vs viz).
-- **Caching.** Same question asked twice = two LLM calls. A small
-  `(question_hash → BrainResponse)` cache would cut cost ~50% on a demo.
-- **Performance benchmark.** No baseline. Cold-start latency is ~3s, warm
-  is ~5–10s end-to-end on the free Render tier.
-
----
-
-## Slack setup
-
-<details>
-<summary>Click to expand — Slack-native usage (optional)</summary>
-
-The Slack flow is the more architecturally interesting surface but takes ~10
-minutes to set up because of Slack app config. The web demo above shows the
-same pipeline with no Slack required.
-
-### Prereqs
-
-- A Slack workspace where you can install apps
-- `SLACK_BOT_TOKEN` (xoxb-…) and `SLACK_APP_TOKEN` (xapp-…) — Socket Mode
-
-### Steps
-
-1. Create a Slack app at <https://api.slack.com/apps> → "From scratch"
-2. **Socket Mode**: enable, generate an app-level token with `connections:write`
-3. **OAuth scopes**: `app_mentions:read`, `chat:write`, `files:write`,
-   `reactions:write`
-4. **Event subscriptions**: subscribe to `app_mention`
-5. Install the app to your workspace, copy bot token + app token
-6. Add both to `.env`:
-
-   ```
-   SLACK_BOT_TOKEN=xoxb-...
-   SLACK_APP_TOKEN=xapp-...
-   ANTHROPIC_API_KEY=sk-ant-...
-   ```
-
-7. Run:
-
-   ```bash
-   uv run python main.py
-   ```
-
-8. In Slack, mention the bot: `@YourBot how many users signed up last month?`
-
-</details>
-
----
-
-## Repo layout
-
-```
-src/hex/
-  shared/      canonical types, interfaces, errors
-  db/          sqlite engine + schema + seed + sanitizer
-  viz/         matplotlib chart engine + inference
-  brain/       claude client + semantic layer + retry loop
-  gateway/     slack bolt + dedup + rate limiter
-  web/         fastapi server + single-page UI
-  app/         orchestrator (the one and only adapter)
-main.py        slack entrypoint
-web_main.py    web entrypoint
-Dockerfile     production container
-render.yaml    one-click Render deploy
-```
-
----
-
-Built as a portfolio project. Feedback welcome.
+Built by Larry Zhang
