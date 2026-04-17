@@ -48,6 +48,53 @@
 
       <!-- Upload panel (hidden until toggle flips) -->
       <section id="upload-panel" class="hidden mb-6 bg-white rounded-xl shadow-sm border border-slate-200 p-5 fade-in">
+        <!--
+          Mock-CSV hint — lowers friction for a cold reviewer who doesn't
+          have their own CSV handy. Absolutely positioned top-right over
+          the drop zone, with a curved arrow pointing into it. Supports
+          both drag-and-drop (preferred, feels like a real file move) and
+          click (fallback for touch devices and anyone who doesn't catch
+          the drag affordance). Visible only inside this panel, so it
+          auto-hides in sample mode without any extra toggle logic.
+        -->
+        <div class="relative">
+          <div id="mock-hint"
+               draggable="true"
+               role="button"
+               tabindex="0"
+               title="Drag into the box, or click to load"
+               class="absolute right-0 -top-1 z-10 flex flex-col items-end select-none cursor-grab active:cursor-grabbing group">
+            <span class="text-sm italic text-slate-500 group-hover:text-slate-800 transition-colors pr-1">Try this CSV</span>
+            <!--
+              Hand-drawn-feeling arrow: a single asymmetric cubic bezier
+              plus a two-stroke arrowhead. Slight wobble in the control
+              points is deliberate — a perfectly symmetric curve reads
+              machine-drawn. Stroke inherits currentColor so the hover
+              state darkens it in sync with the label.
+            -->
+            <!--
+              pointer-events: none on the decorative SVG so dragover
+              events for REAL files passing over the arrow fall through
+              to the drop zone underneath — otherwise the arrow would
+              shadow the top-right corner of the drop target. The text
+              label above stays interactive, which is all the user needs
+              to initiate the mock-csv drag.
+            -->
+            <svg width="84" height="46" viewBox="0 0 84 46" fill="none" aria-hidden="true"
+                 class="text-slate-400 group-hover:text-slate-700 transition-colors -mr-1 pointer-events-none">
+              <path d="M 74 4 C 64 18, 40 22, 14 38"
+                    stroke="currentColor" stroke-width="1.5"
+                    stroke-linecap="round" fill="none"/>
+              <path d="M 14 38 L 23 33"
+                    stroke="currentColor" stroke-width="1.5"
+                    stroke-linecap="round" fill="none"/>
+              <path d="M 14 38 L 21 44"
+                    stroke="currentColor" stroke-width="1.5"
+                    stroke-linecap="round" fill="none"/>
+            </svg>
+          </div>
+        </div>
+
         <div id="drop-zone" class="border-2 border-dashed border-slate-300 rounded-lg p-8 text-center cursor-pointer hover:bg-slate-50">
           <p class="text-slate-700 font-medium">Drop a CSV here, or click to choose a file</p>
           <p class="text-xs text-slate-500 mt-1">Max 5 MB · 10,000 rows · 50 columns</p>
@@ -216,11 +263,62 @@
       drop.ondrop = (e) => {
         e.preventDefault();
         drop.classList.remove("drop-active");
+        // Custom-marker handshake for the "Try this CSV" hint. We can't
+        // stuff a real File into DataTransfer on dragstart reliably
+        // across browsers (Safari's support is patchy), so the hint sets
+        // a typed marker instead and we resolve it to an actual File
+        // here. Real file drops fall through to the existing branch.
+        const types = Array.from(e.dataTransfer.types || []);
+        if (types.includes("text/x-hex-mock-csv")) {
+          loadMockCsv();
+          return;
+        }
         if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
       };
       $("file-input").onchange = (e) => {
         if (e.target.files[0]) upload(e.target.files[0]);
       };
+
+      // ── Mock-CSV hint handlers ───────────────────────────────────────────
+      // Two paths into the same upload() call:
+      //   * drag  — dragstart tags the DataTransfer with our custom type;
+      //             the drop zone's ondrop reads that tag and calls
+      //             loadMockCsv(). Feels like moving a real file.
+      //   * click — touch devices and anyone who doesn't notice the drag
+      //             affordance. Same end result.
+      // Keyboard Enter/Space mirrors click for a11y — the element is
+      // role=button + tabindex=0 in the markup.
+      const mockHint = $("mock-hint");
+      mockHint.addEventListener("dragstart", (e) => {
+        e.dataTransfer.setData("text/x-hex-mock-csv", "1");
+        e.dataTransfer.effectAllowed = "copy";
+      });
+      mockHint.addEventListener("click", () => loadMockCsv());
+      mockHint.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); loadMockCsv(); }
+      });
+
+      async function loadMockCsv() {
+        // Fetches the bundled sample, wraps the bytes in a File, and
+        // hands it to the existing upload() path. Going through upload()
+        // (not a bespoke POST) means the preview, schema render, session
+        // wiring, and error handling are all identical to a real drop —
+        // one code path, no drift.
+        const status = $("upload-status");
+        status.textContent = "Loading sample CSV…";
+        status.className = "mt-4 text-sm text-slate-600";
+        status.classList.remove("hidden");
+        try {
+          const res = await fetch("/static/sample_orders.csv");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const blob = await res.blob();
+          const file = new File([blob], "sample_orders.csv", { type: "text/csv" });
+          upload(file);
+        } catch (err) {
+          status.textContent = "Couldn't load the sample CSV: " + err.message;
+          status.className = "mt-4 text-sm text-red-700";
+        }
+      }
 
       async function upload(file) {
         const status = $("upload-status");
