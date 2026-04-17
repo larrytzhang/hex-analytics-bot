@@ -24,18 +24,27 @@ from hex.db import SQLiteEngine
 from hex.shared.logging import configure_logging
 from hex.viz import ChartEngine
 from hex.web import WebConfig, create_app
+from hex.web.session import SessionManager
 
 load_dotenv()
 configure_logging()
 logger = logging.getLogger(__name__)
 
+# Share one LLMClient + BrainConfig across the default brain and every
+# session brain — the client holds the HTTP pool and the config is
+# immutable, so there's no reason to instantiate them per-session.
+_BRAIN_CONFIG = BrainConfig()
+_LLM_CLIENT = LLMClient(_BRAIN_CONFIG)
 
-def _build_orchestrator() -> AppOrchestrator:
-    """Wire DB → Brain → Viz once at startup.
+
+def _build_orchestrator() -> tuple[AppOrchestrator, SessionManager]:
+    """Wire DB → Brain → Viz once at startup and build the session store.
 
     Mirrors main.py's wiring order minus the Slack gateway. Brain owns DB
-    access (per claude.md §3 Strict Module Boundaries), so the web layer
-    only ever sees the orchestrator.
+    access (per CLAUDE.md §3 Strict Module Boundaries), so the web layer
+    only ever sees the orchestrator. The SessionManager is constructed
+    here too so the factory it holds captures the same shared LLMClient
+    instance as the default brain.
     """
     db = SQLiteEngine()
     if not db.health_check():
@@ -43,16 +52,33 @@ def _build_orchestrator() -> AppOrchestrator:
         sys.exit(1)
 
     chart_engine = ChartEngine()
-    brain_config = BrainConfig()
-    llm_client = LLMClient(brain_config)
-    brain = BrainOrchestrator(brain_config, db, llm_client)
-    logger.info("Web orchestrator wired: model=%s", brain_config.model)
+    default_brain = BrainOrchestrator(_BRAIN_CONFIG, db, _LLM_CLIENT)
+    logger.info("Web orchestrator wired: model=%s", _BRAIN_CONFIG.model)
 
-    return AppOrchestrator(brain, chart_engine, slack_client=None)
+    # Each uploaded-CSV session gets its own Brain wired to its own DB.
+    # Glossary off — the SaaS glossary (MRR, ARR…) is wrong for arbitrary
+    # user schemas and would bias SQL generation.
+    def brain_factory(session_db: SQLiteEngine) -> BrainOrchestrator:
+        return BrainOrchestrator(
+            _BRAIN_CONFIG,
+            session_db,
+            _LLM_CLIENT,
+            use_glossary=False,
+        )
+
+    web_config = WebConfig()
+    session_manager = SessionManager(
+        brain_factory,
+        max_sessions=web_config.MAX_SESSIONS,
+        ttl_seconds=web_config.SESSION_TTL_SECONDS,
+    )
+
+    return AppOrchestrator(default_brain, chart_engine, slack_client=None), session_manager
 
 
 # Module-level so `uvicorn web_main:app` works for dev hot-reload.
-app = create_app(_build_orchestrator())
+_orchestrator, _session_manager = _build_orchestrator()
+app = create_app(_orchestrator, session_manager=_session_manager)
 
 
 if __name__ == "__main__":

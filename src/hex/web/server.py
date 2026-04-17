@@ -20,13 +20,15 @@ import base64
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from hex.shared.errors import CSVValidationError
 from hex.shared.interfaces import OrchestratorInterface
 from hex.web.config import WebConfig
+from hex.web.session import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,9 @@ class AskRequest(BaseModel):
     """
 
     question: str = Field(..., min_length=1, max_length=500)
+    # Optional: when present, routes the question to the uploaded-CSV
+    # session's DB. Absent = default (sample) dataset.
+    session_id: str | None = None
 
 
 class AskResponse(BaseModel):
@@ -69,7 +74,11 @@ class AskResponse(BaseModel):
     error: str | None = None
 
 
-def create_app(orchestrator: OrchestratorInterface, config: WebConfig | None = None) -> FastAPI:
+def create_app(
+    orchestrator: OrchestratorInterface,
+    config: WebConfig | None = None,
+    session_manager: SessionManager | None = None,
+) -> FastAPI:
     """Build a FastAPI app wired to the given orchestrator.
 
     Factory pattern (rather than a module-level app) so tests can inject a
@@ -117,9 +126,22 @@ def create_app(orchestrator: OrchestratorInterface, config: WebConfig | None = N
         if not question:
             raise HTTPException(status_code=422, detail="question is empty")
 
+        # Resolve per-session brain if a session_id was provided. 410 Gone
+        # is the right signal for "your session expired / was evicted" —
+        # distinguishable from 404 on the session endpoint so the UI can
+        # differentiate "never existed" vs "timed out."
+        brain_override = None
+        if payload.session_id:
+            if session_manager is None:
+                raise HTTPException(status_code=400, detail="upload not configured on this server")
+            session = session_manager.get(payload.session_id)
+            if session is None:
+                raise HTTPException(status_code=410, detail="session expired — upload again")
+            brain_override = session.brain
+
         try:
             answer = await asyncio.wait_for(
-                orchestrator.compute_answer(question),
+                orchestrator.compute_answer(question, brain_override=brain_override),
                 timeout=cfg.REQUEST_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -158,6 +180,91 @@ def create_app(orchestrator: OrchestratorInterface, config: WebConfig | None = N
             latency_ms=answer.latency_ms,
             error=answer.error,
         )
+
+    @app.post("/api/upload")
+    async def upload(file: UploadFile = File(...)) -> dict:
+        """Accept a CSV, build a session, return its id + schema preview.
+
+        Size cap is enforced twice: once at the HTTP layer (fast reject of
+        a firehose), once inside the CSV loader (authoritative number). We
+        stream the body up to MAX_UPLOAD_BYTES + 1 so an oversize payload
+        gets a 413 before we allocate the full buffer.
+        """
+        if session_manager is None:
+            raise HTTPException(
+                status_code=501,
+                detail="uploads are not enabled on this server",
+            )
+
+        # Enforce size guard before reading the whole body. FastAPI gives
+        # us a spooled temp file, but .read() without a cap still loads
+        # everything into memory — so we read-with-limit instead.
+        body = await file.read(cfg.MAX_UPLOAD_BYTES + 1)
+        if len(body) > cfg.MAX_UPLOAD_BYTES:
+            mb = cfg.MAX_UPLOAD_BYTES // (1024 * 1024)
+            raise HTTPException(
+                status_code=413,
+                detail=f"file too large — max {mb} MB",
+            )
+        if not body:
+            raise HTTPException(status_code=422, detail="uploaded file is empty")
+
+        filename = file.filename or "upload.csv"
+
+        # CSV parse + session creation both sit behind a single try so the
+        # validation error path is uniform. Any CSVValidationError means
+        # the file is unusable — 422 with the loader's user-facing message.
+        try:
+            session = session_manager.create(body, filename)
+        except CSVValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        return {
+            "session_id": session.session_id,
+            "table_name": session.loaded_table.table_name,
+            "columns": session.loaded_table.columns,
+            "row_count": session.loaded_table.row_count,
+            "preview_rows": session.loaded_table.preview_rows,
+        }
+
+    @app.get("/api/session/{session_id}")
+    async def get_session(session_id: str) -> dict:
+        """Return metadata for an existing session, or 404 if gone.
+
+        Powers the frontend's reload-restore path: the UI stashes the id
+        in localStorage, and on page load calls this to decide whether
+        to repaint the "uploaded data" mode or fall back to the sample
+        dataset. 404 (not 410) here because this endpoint is a pure
+        lookup — a missing id is indistinguishable from an expired one
+        from the client's perspective, and treating them the same
+        simplifies the UI.
+        """
+        if session_manager is None:
+            raise HTTPException(status_code=501, detail="uploads are not enabled")
+        session = session_manager.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return {
+            "session_id": session.session_id,
+            "table_name": session.loaded_table.table_name,
+            "columns": session.loaded_table.columns,
+            "row_count": session.loaded_table.row_count,
+            "preview_rows": session.loaded_table.preview_rows,
+        }
+
+    @app.delete("/api/session/{session_id}", status_code=204)
+    async def delete_session(session_id: str) -> None:
+        """Drop a session explicitly (the UI's 'Start over' button).
+
+        Idempotent-ish: deleting an unknown id returns 404 so the UI can
+        surface "already gone" distinctly if it ever matters. 204 on
+        success — standard no-body DELETE response.
+        """
+        if session_manager is None:
+            raise HTTPException(status_code=501, detail="uploads are not enabled")
+        if not session_manager.delete(session_id):
+            raise HTTPException(status_code=404, detail="session not found")
+        return None
 
     @app.exception_handler(HTTPException)
     async def http_error_handler(_request, exc: HTTPException) -> JSONResponse:
