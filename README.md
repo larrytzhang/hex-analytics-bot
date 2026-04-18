@@ -71,9 +71,6 @@ Limits (enforced server-side):
   capacity (LRU eviction, 20 concurrent sessions). Click **"Start over"** to
   clear the session explicitly.
 
-To run the **Slack** version locally, see [`docs/slack-setup.md`](#slack-setup)
-at the bottom.
-
 ---
 
 ## What it does
@@ -162,7 +159,7 @@ duplication.
 
 ## Tests
 
-207 tests across the six modules. Run:
+216 tests across the six modules. Run:
 
 ```bash
 uv run pytest src/hex
